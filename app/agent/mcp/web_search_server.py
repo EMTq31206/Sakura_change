@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import sys
-from dataclasses import dataclass
 from html.parser import HTMLParser
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from app.agent.web_search import search_bing_rss
 
 
 SERVER_NAME = "sakura-web-search"
@@ -21,17 +27,10 @@ USER_AGENT = (
 )
 
 
-@dataclass(frozen=True)
-class SearchResult:
-    title: str
-    url: str
-    snippet: str = ""
-
-
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "web_search",
-        "description": "搜索公开网页，并返回标题、链接和简短摘要。适合查询最新信息、资料来源和网页入口。",
+        "description": "搜索公开网页，并返回标题、链接和简短摘要。适合查询最新信息、资料来源和网页入口；搜索需求必须先用本工具，不要自行拼接搜索 URL。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -53,7 +52,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "fetch_url",
-        "description": "读取一个公开 http/https 网页，抽取标题、正文文本和页面链接。",
+        "description": "读取一个明确的公开 http/https 内容页，抽取标题、正文文本和页面链接。不要传 Google/Bing 搜索结果页；搜索需求先用 web_search。返回 status/guidance 用于判断是否为空页、动态页或错误 URL。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -63,7 +62,7 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "正文最多返回多少字符，范围 500-20000。",
+                    "description": "正文最多返回多少字符，范围 500-20000。建议需要网页详情时使用 12000 或更高。",
                     "minimum": 500,
                     "maximum": 20000,
                     "default": 6000,
@@ -80,9 +79,19 @@ def main() -> int:
     try:
         _run_fastmcp_server()
         return 0
-    except ImportError:
-        # 测试环境或未安装 mcp 时保留轻量 JSON-RPC fallback，正式运行应使用 FastMCP。
-        pass
+    except ImportError as exc:
+        # mcp 库未安装时，fallback 到轻量 JSON-RPC。
+        # 但 MCP 客户端默认按 Content-Length 分帧（LSP 风格），
+        # 这里的 fallback 按 newline 分帧，协议不匹配会导致大量请求解析失败。
+        # 因此打印醒目警告，提醒用户安装 mcp 库；fallback 仍保留以便调试。
+        sys.stderr.write(
+            "[sakura-web-search] 警告：未安装 mcp 库（ImportError: "
+            + str(exc)
+            + "），已降级到不兼容的 newline-delimited JSON-RPC fallback。\n"
+            "MCP 客户端很可能无法正常通信，Web 搜索/抓取工具会失败。\n"
+            "请运行：pip install -r requirements.txt  （需要 mcp>=1.9）\n"
+        )
+        sys.stderr.flush()
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -105,7 +114,7 @@ def _run_fastmcp_server() -> None:
 
     @mcp.tool(
         name="web_search",
-        description="搜索公开网页，并返回标题、链接和简短摘要。适合查询最新信息、资料来源和网页入口。",
+        description="搜索公开网页，并返回标题、链接和简短摘要。适合查询最新信息、资料来源和网页入口；搜索需求必须先用本工具，不要自行拼接搜索 URL。",
         structured_output=True,
     )
     def web_search_tool(query: str, max_results: int = 5) -> dict[str, Any]:
@@ -118,7 +127,7 @@ def _run_fastmcp_server() -> None:
 
     @mcp.tool(
         name="fetch_url",
-        description="读取一个公开 http/https 网页，抽取标题、正文文本和页面链接。",
+        description="读取一个明确的公开 http/https 内容页，抽取标题、正文文本和页面链接。不要传 Google/Bing 搜索结果页；搜索需求先用 web_search。返回 status/guidance 用于判断是否为空页、动态页或错误 URL。",
         structured_output=True,
     )
     def fetch_url_tool(url: str, max_chars: int = 6000) -> dict[str, Any]:
@@ -194,14 +203,10 @@ def search_web(query: str, max_results: int = 5) -> dict[str, Any]:
     if not query:
         raise ValueError("query 不能为空。")
 
-    url = "https://lite.duckduckgo.com/lite/?" + urlencode({"q": query})
-    html_text = _read_url_text(url, max_bytes=512_000)
-    parser = DuckDuckGoLiteParser()
-    parser.feed(html_text)
-    results = _dedupe_results(parser.results)[:max_results]
+    results = _merged_search_results(query, max_results=max_results)
     return {
         "query": query,
-        "source": "DuckDuckGo Lite",
+        "source": "Bing",
         "results": [
             {"title": item.title, "url": item.url, "snippet": item.snippet}
             for item in results
@@ -211,6 +216,10 @@ def search_web(query: str, max_results: int = 5) -> dict[str, Any]:
 
 def fetch_url(url: str, max_chars: int = 6000) -> dict[str, Any]:
     normalized_url = _validate_public_http_url(url)
+    search_page_warning = _search_page_warning(normalized_url)
+    mojibake_warning = _mojibake_url_warning(normalized_url)
+    if search_page_warning or mojibake_warning:
+        return _blocked_fetch_result(normalized_url, search_page_warning, mojibake_warning)
     raw_text, content_type, final_url = _read_url_text_with_metadata(
         normalized_url,
         max_bytes=max(256_000, min(max_chars * 8, 1_500_000)),
@@ -225,6 +234,14 @@ def fetch_url(url: str, max_chars: int = 6000) -> dict[str, Any]:
         text = _normalize_space(raw_text)
         title = ""
         links = []
+    status, guidance = _fetch_status_and_guidance(
+        url=final_url,
+        title=title,
+        text=text,
+        content_type=content_type,
+        search_page_warning=search_page_warning,
+        mojibake_warning=mojibake_warning,
+    )
     return {
         "url": final_url,
         "content_type": content_type,
@@ -232,56 +249,113 @@ def fetch_url(url: str, max_chars: int = 6000) -> dict[str, Any]:
         "text": text[:max_chars],
         "truncated": len(text) > max_chars,
         "links": links,
+        "status": status,
+        "guidance": guidance,
     }
 
 
-class DuckDuckGoLiteParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.results: list[SearchResult] = []
-        self._active_href = ""
-        self._active_text: list[str] = []
-        self._last_result_index: int | None = None
-        self._collect_snippet = False
-        self._snippet_parts: list[str] = []
+def _merged_search_results(query: str, max_results: int) -> list[Any]:
+    seen: set[str] = set()
+    merged: list[Any] = []
+    for candidate in _search_query_candidates(query):
+        for item in search_bing_rss(candidate, max_results=max_results):
+            key = item.url.rstrip("/")
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+            if len(merged) >= max_results:
+                return merged
+    return merged
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attrs_map = {key.lower(): value or "" for key, value in attrs}
-        if tag == "a":
-            href = _normalize_result_href(attrs_map.get("href", ""))
-            if href:
-                self._active_href = href
-                self._active_text = []
-        elif tag in {"td", "span"} and self._last_result_index is not None:
-            self._collect_snippet = True
-            self._snippet_parts = []
 
-    def handle_data(self, data: str) -> None:
-        if self._active_href:
-            self._active_text.append(data)
-        elif self._collect_snippet:
-            self._snippet_parts.append(data)
+def _search_query_candidates(query: str) -> list[str]:
+    candidates = [query]
+    simplified = re.sub(r"\bsite:\S+", " ", query, flags=re.I)
+    simplified = re.sub(r"\b(?:https?://)?(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}\b", " ", simplified, flags=re.I)
+    simplified = " ".join(simplified.split())
+    if simplified and simplified != query:
+        if re.search(r"\bsite:\S+", query, flags=re.I):
+            candidates.append(simplified)
+        else:
+            candidates.insert(0, simplified)
+    return candidates
 
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "a" and self._active_href:
-            title = _normalize_space("".join(self._active_text))
-            if title and _looks_like_result_url(self._active_href):
-                self.results.append(SearchResult(title=title, url=self._active_href))
-                self._last_result_index = len(self.results) - 1
-            self._active_href = ""
-            self._active_text = []
-        elif tag in {"td", "span"} and self._collect_snippet:
-            snippet = _normalize_space("".join(self._snippet_parts))
-            if snippet and self._last_result_index is not None:
-                previous = self.results[self._last_result_index]
-                if not previous.snippet and snippet != previous.title:
-                    self.results[self._last_result_index] = SearchResult(
-                        title=previous.title,
-                        url=previous.url,
-                        snippet=snippet[:300],
-                    )
-            self._collect_snippet = False
-            self._snippet_parts = []
+
+def _blocked_fetch_result(url: str, *warnings: str) -> dict[str, Any]:
+    guidance = " ".join(warning for warning in warnings if warning)
+    return {
+        "url": url,
+        "content_type": "",
+        "title": "",
+        "text": "",
+        "truncated": False,
+        "links": [],
+        "status": "warning",
+        "guidance": guidance,
+    }
+
+
+def _search_page_warning(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if host.endswith("google.com") and path.startswith("/search"):
+        query = parse_qs(parsed.query).get("q", [""])[0]
+        return (
+            "这是 Google 搜索结果页，不适合用 fetch_url 读取。"
+            f"请改用 web_search，query={query!r}。"
+        )
+    if host.endswith("bing.com") and path.startswith("/search"):
+        query = parse_qs(parsed.query).get("q", [""])[0]
+        return (
+            "这是 Bing 搜索结果页，不适合用 fetch_url 读取。"
+            f"请改用 web_search，query={query!r}。"
+        )
+    return ""
+
+
+def _mojibake_url_warning(url: str) -> str:
+    parsed = urlparse(url)
+    query_text = " ".join(value for values in parse_qs(parsed.query).values() for value in values)
+    if _looks_mojibake(query_text):
+        return "URL 查询参数疑似编码损坏。不要继续使用这个 URL，请回到原始自然语言问题并调用 web_search。"
+    return ""
+
+
+def _looks_mojibake(text: str) -> bool:
+    if not text:
+        return False
+    markers = {"�", "Ã", "Â", "ƒ", "∆", "Ω", "Í", "Ò", "Ó", "¬", "»", "«"}
+    hits = sum(text.count(marker) for marker in markers)
+    return hits >= 2 or (hits >= 1 and not any("\u4e00" <= char <= "\u9fff" for char in text))
+
+
+def _fetch_status_and_guidance(
+    *,
+    url: str,
+    title: str,
+    text: str,
+    content_type: str,
+    search_page_warning: str,
+    mojibake_warning: str,
+) -> tuple[str, str]:
+    warnings = [warning for warning in (search_page_warning, mojibake_warning) if warning]
+    if not text.strip():
+        warnings.append(
+            "页面没有抽取到可读正文。可能是错误 URL、动态渲染页面、反爬页面或空页面；请先用 web_search 找到更可靠的具体页面。"
+        )
+        return "empty_text", " ".join(warnings)
+    if warnings:
+        return "warning", " ".join(warnings)
+    if len(text) < 300 and "html" in content_type.lower():
+        warnings.append(
+            "页面正文很短，可能不是目标内容页；请检查 title/url 是否匹配用户问题，必要时重新 web_search。"
+        )
+        return "limited_text", " ".join(warnings)
+    if "github.com/trending" in url and "Trending repositories" in title:
+        return "ok", "GitHub trending 是可抓取的静态 HTML；请直接从 text 中提取仓库名、描述和链接，不要改用搜索页。"
+    return "ok", "页面正文已抽取；请基于 title/text/links 回答，不要臆造页面外信息。"
 
 
 class PageTextParser(HTMLParser):
@@ -353,8 +427,14 @@ def _read_url_text_with_metadata(url: str, max_bytes: int) -> tuple[str, str, st
             body = response.read(max_bytes + 1)
             final_url = response.geturl()
     except HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code}: {exc.reason}") from exc
+        raise RuntimeError(_friendly_http_error_message(url, exc)) from exc
     except URLError as exc:
+        reason = str(exc.reason)
+        if "timed out" in reason.lower() or "timeout" in reason.lower():
+            raise RuntimeError(
+                f"读取超时（{DEFAULT_TIMEOUT_SECONDS}s）：{url}。"
+                "该站点响应慢或不可达，建议改用 web_search 获取摘要，不要反复重试同一 URL。"
+            ) from exc
         raise RuntimeError(f"网络请求失败：{exc.reason}") from exc
 
     charset = _charset_from_content_type(content_type)
@@ -366,47 +446,39 @@ def _read_url_text_with_metadata(url: str, max_bytes: int) -> tuple[str, str, st
         return body.decode("utf-8", errors="replace"), content_type, final_url
 
 
+def _friendly_http_error_message(url: str, exc: HTTPError) -> str:
+    """把 HTTPError 翻译成模型可理解的诊断信息，引导它改用 web_search。"""
+    try:
+        code = int(exc.code)
+    except (TypeError, ValueError):
+        code = 0
+    host = (urlparse(url).hostname or "").lower()
+    reason = str(exc.reason or "")
+    if code == 403:
+        return (
+            f"HTTP 403 被拒绝（{host}）：该站点有反爬/Cloudflare 拦截，无法直接抓取正文。"
+            "不要反复重试同一 URL，改用 web_search 获取其他来源的摘要。"
+        )
+    if code == 429:
+        return (
+            f"HTTP 429 限流（{host}）：请求过于频繁被暂时拒绝。"
+            "等待片刻或改用 web_search 找其他来源。"
+        )
+    if code in (401, 407):
+        return f"HTTP {code} 需要认证（{host}）：该页面需要登录，fetch_url 无法读取，改用 web_search。"
+    if 400 <= code < 500:
+        return f"HTTP {code} 客户端错误（{host}：{reason}）：URL 可能失效或不公开，改用 web_search。"
+    if 500 <= code < 600:
+        return f"HTTP {code} 服务端错误（{host}：{reason}）：站点暂时不可用，稍后再试或改用 web_search。"
+    return f"HTTP {code}: {reason}"
+
+
 def _charset_from_content_type(content_type: str) -> str:
     for part in content_type.split(";"):
         part = part.strip()
         if part.lower().startswith("charset="):
             return part.split("=", 1)[1].strip()
     return "utf-8"
-
-
-def _normalize_result_href(href: str) -> str:
-    href = html.unescape(href.strip())
-    if not href:
-        return ""
-    if href.startswith("//"):
-        href = "https:" + href
-    elif href.startswith("/"):
-        href = "https://duckduckgo.com" + href
-    parsed = urlparse(href)
-    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
-        target = parse_qs(parsed.query).get("uddg", [""])[0]
-        href = unquote(target)
-    return href
-
-
-def _looks_like_result_url(url: str) -> bool:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        return False
-    host = parsed.netloc.lower()
-    return "duckduckgo.com" not in host
-
-
-def _dedupe_results(results: list[SearchResult]) -> list[SearchResult]:
-    seen: set[str] = set()
-    deduped: list[SearchResult] = []
-    for item in results:
-        key = item.url.rstrip("/")
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
-    return deduped
 
 
 def _validate_public_http_url(url: str) -> str:

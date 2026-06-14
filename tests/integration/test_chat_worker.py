@@ -54,6 +54,8 @@ def test_chat_worker_forwards_progress_signal() -> None:
     from app.core.chat_worker import ChatWorker
 
     class Runtime:
+        vision_client = None
+
         def handle_user_message(self, _messages, progress_callback=None):  # type: ignore[no-untyped-def]
             if progress_callback is not None:
                 progress_callback(
@@ -113,7 +115,8 @@ def test_chat_worker_records_visual_observation_before_reply() -> None:
             )
 
     class Runtime:
-        api_client = Client()
+        api_client = object()
+        vision_client = Client()
 
         def handle_user_message(self, _messages, progress_callback=None):  # type: ignore[no-untyped-def]
             return AgentResult(

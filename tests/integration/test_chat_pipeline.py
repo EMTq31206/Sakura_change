@@ -12,6 +12,7 @@ from app.storage.visual_observation import VisualObservationJob, VisualObservati
 
 class RuntimeStub:
     api_client = object()
+    vision_client = None
 
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -71,7 +72,8 @@ def test_chat_pipeline_injects_event_visual_contexts() -> None:
             )
 
     runtime = RuntimeStub()
-    runtime.api_client = Client()
+    runtime.api_client = object()
+    runtime.vision_client = Client()
     path = Path("__pycache__") / "test_runtime" / f"visual_pipeline_{uuid.uuid4().hex}.jsonl"
     try:
         pipeline = ChatPipeline(
@@ -105,5 +107,86 @@ def test_chat_pipeline_injects_event_visual_contexts() -> None:
         assert visual_context["summary"] == "屏幕正在编辑 prompt_templates.py。"
         assert "prompt_templates.py" in visual_context["visible_texts"]
         assert "data:image" not in json.dumps(visual_context, ensure_ascii=False)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_chat_pipeline_summarizes_image_before_main_runtime() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.vision_calls = 0
+
+        def complete_vision_raw(self, _system_prompt, messages, **_kwargs):  # type: ignore[no-untyped-def]
+            self.vision_calls += 1
+            assert "data:image/jpeg;base64,screen" in json.dumps(messages)
+            return json.dumps(
+                {
+                    "summary": "屏幕中打开了缓存统计页面。",
+                    "visible_texts": ["prompt_cache_hit_tokens"],
+                    "uncertain_texts": [],
+                    "notable_elements": ["统计面板"],
+                    "confidence": 0.96,
+                },
+                ensure_ascii=False,
+            )
+
+        complete_raw = complete_vision_raw
+
+    class Runtime(RuntimeStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.api_client = object()
+            self.vision_client = Client()
+            self.received_messages: list[dict[str, object]] = []
+
+        def handle_user_message(self, messages, progress_callback=None):  # type: ignore[no-untyped-def]
+            self.received_messages = messages
+            return AgentResult(parse_chat_reply("見えたよ"), [])
+
+    runtime = Runtime()
+    path = Path("__pycache__") / "test_runtime" / f"visual_chat_{uuid.uuid4().hex}.jsonl"
+    try:
+        pipeline = ChatPipeline(
+            runtime,  # type: ignore[arg-type]
+            visual_observation_store=VisualObservationStore(path),
+        )
+        pipeline.run_user_message(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看看屏幕"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/jpeg;base64,screen",
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                }
+            ],
+            visual_observation_jobs=[
+                VisualObservationJob(
+                    id="vis_chat",
+                    source="manual_screenshot",
+                    user_text="看看屏幕",
+                    screen_contexts=[
+                        {
+                            "data_url": "data:image/jpeg;base64,screen",
+                            "screen_name": "primary",
+                            "width": 1280,
+                            "height": 720,
+                        }
+                    ],
+                )
+            ],
+        )
+
+        encoded = json.dumps(runtime.received_messages, ensure_ascii=False)
+        # 有 vision_client 时走"屏幕观察→mimo直答"分支：图片直接传给主 runtime，
+        # 不再单独调用 vision summary，也不再替换为文本摘要。
+        assert "data:image" in encoded
+        assert "看看屏幕" in encoded
     finally:
         path.unlink(missing_ok=True)

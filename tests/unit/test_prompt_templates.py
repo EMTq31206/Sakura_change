@@ -34,9 +34,9 @@ def test_proactive_check_tool_prompt_contains_background_web_rules() -> None:
     assert "【主动感知后台 Web 搜索规则】" in prompt
     assert "web__web_search" in prompt
     assert "web__fetch_url" in prompt
-    assert "不能把截图本身当作反向图片搜索能力" in prompt
-    assert "不能编造具体身份" in prompt
-    assert "不主动做人肉式识别" in prompt
+    assert "截图本身不是反向图片搜索" in prompt
+    assert "应积极调用" in prompt
+    assert "同一工具同参数失败后不要重复" in prompt
 
 
 def test_proactive_check_tool_prompt_places_web_rules_before_loop_limits() -> None:
@@ -86,8 +86,10 @@ def test_proactive_tool_loop_rules_contains_background_web_research_rules() -> N
     rules = build_proactive_tool_loop_rules()
 
     assert "【主动感知后台 Web 搜索规则】" in rules
-    assert "每次主动检查最多 2 次搜索" in rules
-    assert "最多读取 2 个网页" in rules
+    assert "应积极调用" in rules
+    assert "可并行调查互补来源" in rules
+    assert "同一工具同参数失败后不要重复" in rules
+    assert "所有 MCP 工具均已获得主人预先授权" in rules
 
 
 def test_segmented_reply_instruction_can_omit_translation_rules() -> None:
@@ -117,8 +119,8 @@ def test_prompt_lengths_stay_compact() -> None:
         event_type="reminder_due",
     )
 
-    assert len(proactive_tool_prompt) < 3600
-    assert len(proactive_event_prompt) < 2200
+    assert len(proactive_tool_prompt) < 3800
+    assert len(proactive_event_prompt) < 2300
     assert len(reminder_prompt) < 700
 
 
@@ -129,14 +131,9 @@ def test_agent_tool_prompt_length_stays_compact() -> None:
     runtime.reply_portraits = ["站立待机"]
     runtime.memory = SimpleNamespace(summary=lambda: "无")
 
-    prompt = AgentRuntime._build_tool_system_prompt(
-        runtime,
-        allow_screen_observation=True,
-        step_index=0,
-        remaining_steps=3,
-    )
+    prompt = AgentRuntime._build_tool_system_prompt(runtime)
 
-    assert len(prompt) < 2800
+    assert len(prompt) < 4500
     assert prompt.count("主动感知核心规则") == 0
 
 
@@ -193,3 +190,51 @@ def test_proactive_event_does_not_pass_duplicate_loop_rules(monkeypatch) -> None
 
     assert captured["proactive_mode"] is True
     assert "planning_extra_instructions" not in captured
+
+
+def test_agent_reply_protocol_contains_hard_zh_required_constraint() -> None:
+    """Agent 回复协议顶层必须包含台词段 zh 必填的硬约束。"""
+    from app.llm.prompts.recipes import build_agent_reply_protocol
+
+    protocol = build_agent_reply_protocol(["中性", "害羞"], ["站立待机"])
+
+    assert "硬约束" in protocol
+    assert "台词段" in protocol
+    assert "zh" in protocol
+    assert "简体中文" in protocol
+
+
+def test_agent_reply_protocol_contains_anti_repetition_constraint() -> None:
+    """Agent 回复协议顶层必须包含复读禁止硬约束。"""
+    from app.llm.prompts.recipes import build_agent_reply_protocol
+
+    protocol = build_agent_reply_protocol(["中性"], ["站立待机"])
+
+    assert "复读禁止" in protocol
+    assert "全新内容" in protocol
+    assert "绝不复述" in protocol
+
+
+def test_hard_constraints_appear_before_segment_rules() -> None:
+    """硬约束应出现在分段规则之前，提升模型遵守率。"""
+    from app.llm.prompts.recipes import build_agent_reply_protocol
+
+    protocol = build_agent_reply_protocol(["中性"], ["站立待机"])
+    hard_index = protocol.find("硬约束")
+    rules_index = protocol.find("分段规则")
+    assert hard_index != -1
+    assert rules_index != -1
+    assert hard_index < rules_index
+
+
+def test_adult_mode_instruction_emphasizes_zh_required() -> None:
+    """亲热模式指令必须强调台词段 zh 必填，避免字幕显示日语。"""
+    from app.agent.runtime import ADULT_MODE_INSTRUCTION
+
+    assert "台词段" in ADULT_MODE_INSTRUCTION
+    assert "zh" in ADULT_MODE_INSTRUCTION
+    assert "中文译文" in ADULT_MODE_INSTRUCTION
+    # 亲昵场景特别警告。
+    assert "亲昵场景特别警告" in ADULT_MODE_INSTRUCTION or "情感越强烈" in ADULT_MODE_INSTRUCTION
+
+

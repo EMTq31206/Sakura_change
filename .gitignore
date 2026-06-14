@@ -36,8 +36,19 @@ data/tts_bundles/
 data/logs/
 tts/
 data/config/api.yaml
+data/config/api.yaml.*
 data/config/characters.yaml
 data/config/system_config.yaml
+
+# 私人开发记录（含 API key、个人路径，不公开）
+docs/HANDOFF_*.md
+docs/SETUP_HANDOFF.md
+
+# 本地脚本与杂项
+switch_card_*.sh
+scripts/python_env.sh
+.DS_Store
+
 task.md
 log.txt
 

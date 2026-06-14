@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-import webbrowser
+import subprocess
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -54,10 +54,20 @@ def open_url(arguments: dict[str, Any]) -> dict[str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("URL 只支持 http:// 或 https://。")
-    opened = webbrowser.open(url)
+    # Use osascript to reliably open URL in user's default browser
+    applescript = f'open location "{url}"'
+    result = subprocess.run(
+        ["osascript", "-e", applescript],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"浏览器打开失败：{result.stderr.strip() or '未知错误'}")
     return {
         "url": url,
-        "opened": opened,
+        "opened": True,
     }
 
 
@@ -69,10 +79,7 @@ def open_local_folder(arguments: dict[str, Any]) -> dict[str, Any]:
     if not path.is_dir():
         raise ValueError(f"不是文件夹：{path}")
 
-    if os.name == "nt":
-        os.startfile(path)  # type: ignore[attr-defined]
-    else:
-        webbrowser.open(path.as_uri())
+    subprocess.run(["open", str(path)], check=False, timeout=10)
     return {
         "path": str(path),
         "opened": True,

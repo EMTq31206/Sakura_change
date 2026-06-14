@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import base64
 import mimetypes
+import secrets
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QStringListModel, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor
+from PySide6.QtCore import (
+    QBuffer,
+    QByteArray,
+    QIODevice,
+    QObject,
+    QStringListModel,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QImage, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -55,6 +67,7 @@ from app.llm.api_client import (
     ApiSettings,
     OpenAICompatibleClient,
     STRUCTURED_JSON_RESPONSE_FORMAT,
+    VisionApiSettings,
 )
 from app.llm.prompts.recipes import build_theme_color_system_prompt
 from app.plugins.discovery import PluginDiscovery, save_plugin_enabled_overrides
@@ -97,6 +110,9 @@ from app.voice.tts import (
     TTS_PROVIDER_CUSTOM_GPT_SOVITS,
     TTS_PROVIDER_GENIE,
     TTS_PROVIDER_GPT_SOVITS,
+    TTS_PRECISION_AUTO,
+    TTS_PRECISION_FP16,
+    TTS_PRECISION_FP32,
     GPTSoVITSTTSSettings,
     TTSConfigError,
 )
@@ -157,6 +173,52 @@ class ApiModelListProbeWorker(QObject):
             self.failed.emit(str(exc))
         else:
             self.succeeded.emit(models)
+        finally:
+            self.finished.emit()
+
+
+class VisionConnectionTestWorker(QObject):
+    succeeded = Signal(str)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, settings: ApiSettings) -> None:
+        super().__init__()
+        self.settings = settings
+
+    @Slot()
+    def run(self) -> None:
+        marker = f"SAKURA-{secrets.randbelow(9000) + 1000}"
+        try:
+            data_url = _build_vision_test_image(marker)
+            message = OpenAICompatibleClient(self.settings).complete_vision_raw(
+                "Read the supplied image. Do not infer from metadata.",
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Return only the exact large text visible in the image.",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url, "detail": "low"},
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=512,
+                temperature=0,
+            )
+            if marker.casefold() not in message.casefold():
+                raise RuntimeError(
+                    "视觉模型未识别测试图片。接口可能返回成功，但图片没有被转发给模型。"
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(marker)
         finally:
             self.finished.emit()
 
@@ -270,7 +332,9 @@ class ThemeAiWorker(QObject):
     def run(self) -> None:
         try:
             data_url = _image_file_to_data_url(self.profile.default_portrait_path)
-            content = OpenAICompatibleClient(self.settings).complete_raw(
+            client = OpenAICompatibleClient(self.settings)
+            complete_vision = getattr(client, "complete_vision_raw", client.complete_raw)
+            content = complete_vision(
                 build_theme_color_system_prompt(self.profile.display_name),
                 [
                     {
@@ -365,11 +429,13 @@ class SettingsDialog(QDialog):
         subtitle_typing_interval_ms: int = SPEECH_TYPING_INTERVAL_MS,
         reply_segment_pause_ms: int = REPLY_SEGMENT_PAUSE_MS,
         theme_settings: ThemeSettings | None = None,
+        vision_settings: VisionApiSettings | None = None,
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
         self.tts_settings = tts_settings
         self._initial_api_settings = api_settings
+        self._initial_vision_settings = vision_settings or VisionApiSettings()
         self._initial_tts_settings = tts_settings
         self._initial_character_id = current_character.id if current_character is not None else None
         self.theme_settings = _theme_settings_for_character(
@@ -400,6 +466,7 @@ class SettingsDialog(QDialog):
         self._editing_memory_id: str | None = None
         self._active_memory_id: str | None = None
         self.result_api_settings: ApiSettings | None = None
+        self.result_vision_settings: VisionApiSettings | None = None
         self.result_tts_settings: GPTSoVITSTTSSettings | None = None
         self.result_character_id: str | None = None
         self.result_portrait_scale_percent: int | None = None
@@ -415,9 +482,14 @@ class SettingsDialog(QDialog):
         self._api_test_worker: ApiConnectionTestWorker | None = None
         self._api_model_probe_thread: QThread | None = None
         self._api_model_probe_worker: ApiModelListProbeWorker | None = None
+        self._vision_test_thread: QThread | None = None
+        self._vision_test_worker: VisionConnectionTestWorker | None = None
         self._tts_test_thread: QThread | None = None
         self._tts_test_worker: TTSTestWorker | None = None
         self._pending_api_accept_values: dict[str, object] | None = None
+        self._pending_vision_accept_values: dict[str, object] | None = None
+        self._vision_test_result: tuple[bool, str] | None = None
+        self._model_probe_target = "chat"
         self._pending_accept_values: dict[str, object] | None = None
         self._save_button_text: str | None = None
         self._memory_list_thread: QThread | None = None
@@ -449,7 +521,13 @@ class SettingsDialog(QDialog):
         tabs.addTab(
             self._build_grouped_settings_tab(
                 [
-                    ("API", self._build_api_tab(api_settings)),
+                    (
+                        "API",
+                        self._build_api_tab(
+                            api_settings,
+                            self._initial_vision_settings,
+                        ),
+                    ),
                     ("TTS", self._build_tts_tab(tts_settings)),
                 ]
             ),
@@ -706,7 +784,11 @@ class SettingsDialog(QDialog):
         container.setLayout(layout)
         return container
 
-    def _build_api_tab(self, settings: ApiSettings) -> QWidget:
+    def _build_api_tab(
+        self,
+        settings: ApiSettings,
+        vision_settings: VisionApiSettings,
+    ) -> QWidget:
         tab = QWidget(self)
         self.base_url_edit = QLineEdit(settings.base_url, tab)
         self.base_url_edit.setPlaceholderText("https://api.openai.com/v1")
@@ -719,6 +801,26 @@ class SettingsDialog(QDialog):
         self.model_edit.setText(settings.model)
         self.model_edit.setPlaceholderText("gpt-4.1-mini")
 
+        self.vision_enabled_check = QCheckBox("启用独立图片理解模型", tab)
+        self.vision_enabled_check.setChecked(vision_settings.enabled)
+        self.vision_base_url_edit = QLineEdit(vision_settings.base_url, tab)
+        self.vision_base_url_edit.setPlaceholderText("https://tokeness.cn/v1")
+        self.vision_api_key_edit = QLineEdit(vision_settings.api_key, tab)
+        self.vision_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.vision_api_key_edit.setPlaceholderText("请输入视觉 API Key")
+        self.vision_model_edit = ModelComboBox(tab)
+        self.vision_model_edit.setText(vision_settings.model)
+        self.vision_model_edit.setPlaceholderText("例如 mimo-v2.5")
+        self.vision_model_edit.setToolTip(
+            "图片只发送给此模型；主对话模型仅接收结构化视觉摘要。"
+        )
+        self.vision_timeout_spin = QSpinBox(tab)
+        self.vision_timeout_spin.setRange(1, 600)
+        self.vision_timeout_spin.setSuffix(" 秒")
+        self.vision_timeout_spin.setValue(vision_settings.timeout_seconds)
+        self.vision_model_probe_button = QPushButton("检测视觉模型", tab)
+        self.vision_model_probe_button.clicked.connect(self._probe_vision_models)
+
         self.api_timeout_spin = QSpinBox(tab)
         self.api_timeout_spin.setRange(1, 600)
         self.api_timeout_spin.setSuffix(" 秒")
@@ -729,6 +831,8 @@ class SettingsDialog(QDialog):
 
         self.api_test_button = QPushButton("测试 API", tab)
         self.api_test_button.clicked.connect(self._test_api_settings)
+        self.vision_test_button = QPushButton("测试视觉", tab)
+        self.vision_test_button.clicked.connect(self._test_vision_settings)
 
         api_actions = QWidget(tab)
         api_actions_layout = QHBoxLayout(api_actions)
@@ -736,15 +840,22 @@ class SettingsDialog(QDialog):
         api_actions_layout.setSpacing(8)
         api_actions_layout.addWidget(self.api_model_probe_button)
         api_actions_layout.addWidget(self.api_test_button)
+        api_actions_layout.addWidget(self.vision_test_button)
 
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
         form_layout.setSpacing(12)
         form_layout.addRow("Base URL", self.base_url_edit)
         form_layout.addRow("API Key", self.api_key_edit)
-        form_layout.addRow("模型", self.model_edit)
+        form_layout.addRow("对话模型", self.model_edit)
         form_layout.addRow("超时", self.api_timeout_spin)
         form_layout.addRow("", api_actions)
+        form_layout.addRow("", self.vision_enabled_check)
+        form_layout.addRow("视觉 Base URL", self.vision_base_url_edit)
+        form_layout.addRow("视觉 API Key", self.vision_api_key_edit)
+        form_layout.addRow("视觉模型", self.vision_model_edit)
+        form_layout.addRow("视觉超时", self.vision_timeout_spin)
+        form_layout.addRow("", self.vision_model_probe_button)
         tab.setLayout(form_layout)
         return tab
 
@@ -783,6 +894,12 @@ class SettingsDialog(QDialog):
         self.tts_timeout_spin.setRange(1, 600)
         self.tts_timeout_spin.setSuffix(" 秒")
         self.tts_timeout_spin.setValue(settings.timeout_seconds)
+        self.tts_precision_combo = QComboBox(tab)
+        self.tts_precision_combo.addItem("自动（MPS 优先 FP16，失败回退 FP32）", TTS_PRECISION_AUTO)
+        self.tts_precision_combo.addItem("半精度 FP16", TTS_PRECISION_FP16)
+        self.tts_precision_combo.addItem("全精度 FP32", TTS_PRECISION_FP32)
+        precision_index = self.tts_precision_combo.findData(settings.precision_mode)
+        self.tts_precision_combo.setCurrentIndex(precision_index if precision_index >= 0 else 0)
 
         enabled_row = QWidget(tab)
         enabled_layout = QHBoxLayout()
@@ -805,6 +922,7 @@ class SettingsDialog(QDialog):
         form_layout.addRow("参考语言", self.ref_lang_edit)
         form_layout.addRow("文本语言", self.text_lang_edit)
         form_layout.addRow("超时", self.tts_timeout_spin)
+        form_layout.addRow("推理精度", self.tts_precision_combo)
         self._tts_form_layout = form_layout
         tab.setLayout(form_layout)
         self._sync_tts_provider_controls(apply_defaults=_is_bundled_tts_provider(settings.provider))
@@ -1797,8 +1915,11 @@ class SettingsDialog(QDialog):
     def _generate_ai_theme(self) -> None:
         if self._theme_ai_thread is not None:
             return
-        api_settings = self._validated_api_settings()
-        if api_settings is None:
+        vision_settings = self._validated_vision_settings()
+        if vision_settings is None:
+            return
+        if not vision_settings.enabled:
+            QMessageBox.warning(self, "视觉已关闭", "AI 配色需要启用独立图片理解模型。")
             return
         profile = self._selected_character_profile()
         if profile is None:
@@ -1812,7 +1933,7 @@ class SettingsDialog(QDialog):
         self._set_theme_ai_busy(True)
         thread = QThread(self)
         worker = ThemeAiWorker(
-            api_settings,
+            vision_settings.to_api_settings(),
             profile,
             ai_enabled=True,
         )
@@ -1880,6 +2001,9 @@ class SettingsDialog(QDialog):
         return profile is not None and profile.default_portrait_path.exists()
 
     def accept(self) -> None:
+        if self._vision_test_thread is not None:
+            QMessageBox.information(self, "测试中", "视觉测试仍在进行，请等待完成后再保存设置。")
+            return
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再保存设置。")
             return
@@ -1907,6 +2031,17 @@ class SettingsDialog(QDialog):
         self._continue_accept_after_api_test(accept_values)
 
     def _continue_accept_after_api_test(self, accept_values: dict[str, object]) -> None:
+        vision_settings = accept_values["vision_settings"]
+        if (
+            isinstance(vision_settings, VisionApiSettings)
+            and vision_settings.enabled
+            and vision_settings != self._initial_vision_settings
+        ):
+            self._start_vision_settings_test(vision_settings, accept_values)
+            return
+        self._continue_accept_after_vision_test(accept_values)
+
+    def _continue_accept_after_vision_test(self, accept_values: dict[str, object]) -> None:
         tts_settings = accept_values["tts_settings"]
         if self._should_test_tts_on_accept(tts_settings, accept_values["character_id"]):
             self._start_tts_settings_test(tts_settings, accept_values)
@@ -1935,6 +2070,9 @@ class SettingsDialog(QDialog):
         api_settings = self._validated_api_settings()
         if api_settings is None:
             return None
+        vision_settings = self._validated_vision_settings()
+        if vision_settings is None:
+            return None
         tts_settings = self._validated_tts_settings()
         if tts_settings is None:
             return None
@@ -1952,6 +2090,7 @@ class SettingsDialog(QDialog):
         )
         return {
             "api_settings": api_settings,
+            "vision_settings": vision_settings,
             "tts_settings": tts_settings,
             "character_id": character_id,
             "portrait_scale_percent": self._selected_portrait_scale_percent(),
@@ -1978,6 +2117,7 @@ class SettingsDialog(QDialog):
 
     def _complete_accept(self, values: dict[str, object]) -> None:
         api_settings = values["api_settings"]
+        vision_settings = values["vision_settings"]
         tts_settings = values["tts_settings"]
         character_id = values["character_id"]
         portrait_scale_percent = values["portrait_scale_percent"]
@@ -1989,6 +2129,8 @@ class SettingsDialog(QDialog):
         debug_log_settings = values["debug_log_settings"]
 
         if not isinstance(api_settings, ApiSettings):
+            return
+        if not isinstance(vision_settings, VisionApiSettings):
             return
         if not isinstance(tts_settings, GPTSoVITSTTSSettings):
             return
@@ -2016,6 +2158,7 @@ class SettingsDialog(QDialog):
             return
 
         self.result_api_settings = api_settings
+        self.result_vision_settings = vision_settings
         self.result_tts_settings = tts_settings
         self.result_character_id = character_id
         self.result_portrait_scale_percent = portrait_scale_percent
@@ -2036,6 +2179,9 @@ class SettingsDialog(QDialog):
         return save_plugin_enabled_overrides(self.base_dir, enabled_by_id)
 
     def reject(self) -> None:
+        if self._vision_test_thread is not None:
+            QMessageBox.information(self, "测试中", "视觉测试仍在进行，请等待完成后再关闭设置。")
+            return
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再关闭设置。")
             return
@@ -2054,6 +2200,10 @@ class SettingsDialog(QDialog):
         super().reject()
 
     def closeEvent(self, event):  # type: ignore[no-untyped-def]
+        if self._vision_test_thread is not None:
+            QMessageBox.information(self, "测试中", "视觉测试仍在进行，请等待完成后再关闭设置。")
+            event.ignore()
+            return
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再关闭设置。")
             event.ignore()
@@ -2082,6 +2232,7 @@ class SettingsDialog(QDialog):
             settings is None
             or self._api_test_thread is not None
             or self._api_model_probe_thread is not None
+            or self._vision_test_thread is not None
             or self._tts_test_thread is not None
         ):
             return
@@ -2128,6 +2279,82 @@ class SettingsDialog(QDialog):
             return
         QMessageBox.warning(self, "测试失败", message)
 
+    def _test_vision_settings(self) -> None:
+        settings = self._validated_vision_settings()
+        if (
+            settings is None
+            or self._vision_test_thread is not None
+            or self._api_test_thread is not None
+            or self._api_model_probe_thread is not None
+        ):
+            return
+        if not settings.enabled:
+            QMessageBox.information(self, "视觉已关闭", "请先启用独立图片理解模型。")
+            return
+        self._start_vision_settings_test(settings)
+
+    def _start_vision_settings_test(
+        self,
+        settings: VisionApiSettings,
+        accept_values: dict[str, object] | None = None,
+    ) -> None:
+        if self._vision_test_thread is not None:
+            return
+        self._pending_vision_accept_values = (
+            dict(accept_values) if accept_values is not None else None
+        )
+        self._vision_test_result = None
+        self._set_vision_test_busy(True)
+        thread = QThread()
+        worker = VisionConnectionTestWorker(settings.to_api_settings())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_vision_test_success)
+        worker.failed.connect(self._handle_vision_test_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_vision_test_state)
+        self._vision_test_thread = thread
+        self._vision_test_worker = worker
+        thread.start()
+
+    @Slot(str)
+    def _handle_vision_test_success(self, marker: str) -> None:
+        self._vision_test_result = (True, marker)
+
+    @Slot(str)
+    def _handle_vision_test_failed(self, message: str) -> None:
+        self._vision_test_result = (False, message)
+
+    @Slot()
+    def _reset_vision_test_state(self) -> None:
+        result = self._vision_test_result
+        accept_values = self._pending_vision_accept_values
+        self._vision_test_thread = None
+        self._vision_test_worker = None
+        self._vision_test_result = None
+        self._pending_vision_accept_values = None
+        self._set_vision_test_busy(False)
+        if result is None:
+            return
+        succeeded, message = result
+        if succeeded and accept_values is not None:
+            self._continue_accept_after_vision_test(accept_values)
+            return
+        if succeeded:
+            QMessageBox.information(
+                self,
+                "视觉测试成功",
+                f"视觉模型正确识别了测试图片：{message}",
+            )
+            return
+        QMessageBox.warning(self, "视觉测试失败", message)
+
+    def _set_vision_test_busy(self, busy: bool) -> None:
+        self.vision_test_button.setEnabled(not busy)
+        self.vision_test_button.setText("测试中..." if busy else "测试视觉")
+
     @Slot()
     def _reset_api_test_state(self) -> None:
         self._api_test_thread = None
@@ -2139,6 +2366,7 @@ class SettingsDialog(QDialog):
         self.api_test_button.setEnabled(not busy)
         self.api_test_button.setText("测试中..." if busy else "测试 API")
         self.api_model_probe_button.setEnabled(not busy)
+        self.vision_test_button.setEnabled(not busy and self._vision_test_thread is None)
         if not hasattr(self, "button_box"):
             return
         save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
@@ -2155,6 +2383,7 @@ class SettingsDialog(QDialog):
             self._save_button_text = None
 
     def _probe_api_models(self) -> None:
+        self._model_probe_target = "chat"
         settings = self._validated_api_model_probe_settings()
         if (
             settings is None
@@ -2179,12 +2408,47 @@ class SettingsDialog(QDialog):
         self._api_model_probe_worker = worker
         thread.start()
 
+    def _probe_vision_models(self) -> None:
+        settings = self._validated_vision_settings(require_enabled=False)
+        if settings is None:
+            return
+        if not settings.base_url or not settings.api_key:
+            QMessageBox.warning(self, "配置无效", "请先填写视觉 Base URL 和 API Key。")
+            return
+        self._model_probe_target = "vision"
+        self._start_model_probe(settings.to_api_settings())
+
+    def _start_model_probe(self, settings: ApiSettings) -> None:
+        if (
+            self._api_model_probe_thread is not None
+            or self._api_test_thread is not None
+            or self._tts_test_thread is not None
+        ):
+            return
+        self._set_api_model_probe_busy(True)
+        thread = QThread()
+        worker = ApiModelListProbeWorker(settings)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_api_model_probe_success)
+        worker.failed.connect(self._handle_api_model_probe_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_api_model_probe_state)
+        self._api_model_probe_thread = thread
+        self._api_model_probe_worker = worker
+        thread.start()
+
     @Slot(list)
     def _handle_api_model_probe_success(self, model_names: list[str]) -> None:
         if not model_names:
             QMessageBox.warning(self, "探测失败", "模型列表为空，请检查服务是否暴露 /models 接口。")
             return
-        self.model_edit.set_model_names(model_names)
+        if self._model_probe_target == "vision":
+            self.vision_model_edit.set_model_names(model_names)
+        else:
+            self.model_edit.set_model_names(model_names)
         QMessageBox.information(self, "探测成功", f"已发现 {len(model_names)} 个模型。")
 
     @Slot(str)
@@ -2199,8 +2463,10 @@ class SettingsDialog(QDialog):
 
     def _set_api_model_probe_busy(self, busy: bool) -> None:
         self.api_model_probe_button.setEnabled(not busy)
+        self.vision_model_probe_button.setEnabled(not busy)
         self.api_model_probe_button.setText("检测中..." if busy else "检测模型")
         self.api_test_button.setEnabled(not busy)
+        self.vision_test_button.setEnabled(not busy and self._vision_test_thread is None)
         if not hasattr(self, "button_box"):
             return
         save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
@@ -2336,6 +2602,7 @@ class SettingsDialog(QDialog):
         self.tts_work_dir_edit.setReadOnly(bundled)
         self.tts_python_path_edit.setReadOnly(bundled or provider == TTS_PROVIDER_GENIE)
         self.tts_config_path_edit.setReadOnly(bundled or provider == TTS_PROVIDER_GENIE)
+        self.tts_precision_combo.setEnabled(provider != TTS_PROVIDER_GENIE)
         if bundled and apply_defaults:
             self.tts_api_url_edit.setText(_default_tts_api_url(provider))
             work_dir = default_provider_bundle_work_dir(provider, self.base_dir)
@@ -2576,6 +2843,39 @@ class SettingsDialog(QDialog):
             timeout_seconds=self.api_timeout_spin.value(),
         )
 
+    def _validated_vision_settings(
+        self,
+        *,
+        require_enabled: bool = True,
+    ) -> VisionApiSettings | None:
+        enabled = self.vision_enabled_check.isChecked()
+        settings = VisionApiSettings(
+            enabled=enabled,
+            base_url=self.vision_base_url_edit.text().strip().rstrip("/"),
+            api_key=self.vision_api_key_edit.text().strip(),
+            model=self.vision_model_edit.text().strip(),
+            timeout_seconds=self.vision_timeout_spin.value(),
+        )
+        if not enabled and require_enabled:
+            return settings
+        if settings.base_url and not _is_http_url(settings.base_url):
+            QMessageBox.warning(
+                self,
+                "配置无效",
+                "视觉 Base URL 必须是有效的 http 或 https 地址。",
+            )
+            return None
+        if enabled and not settings.base_url:
+            QMessageBox.warning(self, "配置无效", "视觉 Base URL 不能为空。")
+            return None
+        if enabled and not settings.api_key:
+            QMessageBox.warning(self, "配置无效", "视觉 API Key 不能为空。")
+            return None
+        if enabled and not settings.model:
+            QMessageBox.warning(self, "配置无效", "视觉模型不能为空。")
+            return None
+        return settings
+
     def _validated_api_model_probe_settings(self) -> ApiSettings | None:
         base_url = self.base_url_edit.text().strip().rstrip("/")
         api_key = self.api_key_edit.text().strip()
@@ -2634,6 +2934,9 @@ class SettingsDialog(QDialog):
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=self.tts_timeout_spin.value(),
+                precision_mode=str(
+                    self.tts_precision_combo.currentData() or TTS_PRECISION_AUTO
+                ),
                 provider=provider,
                 work_dir=work_dir,
                 python_path=python_path,
@@ -2663,6 +2966,9 @@ class SettingsDialog(QDialog):
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=self.tts_timeout_spin.value(),
+                precision_mode=str(
+                    self.tts_precision_combo.currentData() or TTS_PRECISION_AUTO
+                ),
                 tone_references=self.tts_settings.tone_references,
             )
         if enabled and validate_enabled:
@@ -2779,6 +3085,25 @@ def _image_file_to_data_url(path: Path) -> str:
         mime_type = "image/png"
     encoded = base64.b64encode(data).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _build_vision_test_image(marker: str) -> str:
+    image = QImage(720, 240, QImage.Format.Format_RGB32)
+    image.fill(QColor("white"))
+    painter = QPainter(image)
+    painter.setPen(QColor("red"))
+    painter.drawRect(8, 8, 704, 224)
+    painter.setPen(QColor("black"))
+    painter.setFont(QFont("Arial", 54, QFont.Weight.Bold))
+    painter.drawText(image.rect(), Qt.AlignmentFlag.AlignCenter, marker)
+    painter.end()
+
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    image.save(buffer, "PNG")
+    buffer.close()
+    return "data:image/png;base64," + bytes(data.toBase64()).decode("ascii")
 
 
 def _compact_memory_id(memory_id: str) -> str:

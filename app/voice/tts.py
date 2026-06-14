@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import array
 import base64
+import hashlib
+import io
 import json
 import math
 import os
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 from urllib.parse import urlencode, urlparse, urlunparse
 
+import yaml
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
@@ -38,6 +41,14 @@ TTS_PROVIDER_NONE = "none"
 TTS_PROVIDER_GPT_SOVITS = "gpt-sovits"
 TTS_PROVIDER_CUSTOM_GPT_SOVITS = "custom-gpt-sovits"
 TTS_PROVIDER_GENIE = "genie-tts"
+TTS_PRECISION_AUTO = "auto"
+TTS_PRECISION_FP16 = "fp16"
+TTS_PRECISION_FP32 = "fp32"
+_SUPPORTED_TTS_PRECISIONS = {
+    TTS_PRECISION_AUTO,
+    TTS_PRECISION_FP16,
+    TTS_PRECISION_FP32,
+}
 DEFAULT_GPT_SOVITS_API_URL = "http://127.0.0.1:9880/tts"
 DEFAULT_GENIE_TTS_API_URL = "http://127.0.0.1:9881/"
 _LOCAL_SERVICE_STARTUP_TIMEOUT_MAX = 180
@@ -70,6 +81,7 @@ class _TTSRequest:
     on_started: TTSCallback | None = None
     on_finished: TTSCallback | None = None
     prepared_audio: TTSPreparedAudio | None = None
+    queued_at: float = field(default_factory=time.perf_counter)
 
 
 class _LocalProcessHandle(Protocol):
@@ -239,6 +251,7 @@ class GPTSoVITSTTSSettings:
     ref_lang: str = "ja"
     text_lang: str = "ja"
     timeout_seconds: int = 60
+    precision_mode: str = TTS_PRECISION_AUTO
     tone_references: dict[str, list[ToneReference]] = field(default_factory=dict)
 
     @classmethod
@@ -250,6 +263,7 @@ class GPTSoVITSTTSSettings:
         ref_lang: str,
         text_lang: str,
         timeout_seconds: int,
+        precision_mode: str = TTS_PRECISION_AUTO,
         provider: str = TTS_PROVIDER_GPT_SOVITS,
         work_dir: Path | None = None,
         python_path: Path | None = None,
@@ -269,6 +283,7 @@ class GPTSoVITSTTSSettings:
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=timeout_seconds,
+                precision_mode=precision_mode,
                 work_dir=work_dir,
                 python_path=python_path,
                 tts_config_path=tts_config_path,
@@ -302,6 +317,7 @@ class GPTSoVITSTTSSettings:
             ref_lang=ref_lang,
             text_lang=text_lang,
             timeout_seconds=timeout_seconds,
+            precision_mode=precision_mode,
             tone_references=tone_references,
         )
         if enabled and validate_enabled:
@@ -313,6 +329,8 @@ class GPTSoVITSTTSSettings:
             raise TTSConfigError("缺少 TTS API URL。")
         if self.provider not in _SUPPORTED_TTS_PROVIDERS:
             raise TTSConfigError(f"不支持的 TTS Provider：{self.provider}")
+        if self.precision_mode not in _SUPPORTED_TTS_PRECISIONS:
+            raise TTSConfigError(f"不支持的 TTS 推理精度：{self.precision_mode}")
         if self.python_path is not None and not self.python_path.exists():
             raise TTSConfigError(f"TTS Python 不存在：{self.python_path}")
         if self.tts_config_path is not None and not self.tts_config_path.exists():
@@ -369,6 +387,10 @@ class GPTSoVITSTTSProvider(QObject):
         self._service_checked = False
         self._server_process: _LocalProcessHandle | None = None
         self._playback_warmup_requested = False
+        self._active_precision = _preferred_tts_precision(settings)
+        self._precision_fallback_used = False
+        self._precision_probe_completed = False
+        self._request_started_at: float | None = None
 
         self._audio_output: QAudioOutput | None = None
         self._player: QMediaPlayer | None = None
@@ -393,7 +415,7 @@ class GPTSoVITSTTSProvider(QObject):
             self._started.emit(on_started)
             self._finished.emit(on_finished)
             return
-        debug_log("TTS", "提交播放请求", {"text": text, "tone": tone})
+        debug_log("TTS", "提交播放请求", {**_text_debug_payload(text), "tone": tone})
         self._queue_request(
             _TTSRequest(
                 text=text,
@@ -410,7 +432,7 @@ class GPTSoVITSTTSProvider(QObject):
             debug_log("TTS", "空文本跳过预生成")
             handle.failed = True
             return handle
-        debug_log("TTS", "提交预生成请求", {"text": text, "tone": tone})
+        debug_log("TTS", "提交预生成请求", {**_text_debug_payload(text), "tone": tone})
         self._queue_request(_TTSRequest(text=text, tone=tone, prepared_audio=handle))
         return handle
 
@@ -421,14 +443,18 @@ class GPTSoVITSTTSProvider(QObject):
         on_finished: TTSCallback | None = None,
     ) -> None:
         if handle.cancelled:
-            debug_log("TTS", "预生成句柄已取消，跳过播放", {"text": handle.text, "tone": handle.tone})
+            debug_log(
+                "TTS",
+                "预生成句柄已取消，跳过播放",
+                {**_text_debug_payload(handle.text), "tone": handle.tone},
+            )
             return
         if not handle.text or handle.failed:
             debug_log(
                 "TTS",
                 "预生成句柄不可播放，直接完成",
                 {
-                    "text": handle.text,
+                    **_text_debug_payload(handle.text),
                     "tone": handle.tone,
                     "failed": handle.failed,
                 },
@@ -443,7 +469,7 @@ class GPTSoVITSTTSProvider(QObject):
             "TTS",
             "请求播放预生成音频",
             {
-                "text": handle.text,
+                **_text_debug_payload(handle.text),
                 "tone": handle.tone,
                 "audio_ready": handle.audio_path is not None,
             },
@@ -453,7 +479,11 @@ class GPTSoVITSTTSProvider(QObject):
 
     def discard_prepared(self, handle: TTSPreparedAudio) -> None:
         handle.cancelled = True
-        debug_log("TTS", "取消预生成音频", {"text": handle.text, "tone": handle.tone})
+        debug_log(
+            "TTS",
+            "取消预生成音频",
+            {**_text_debug_payload(handle.text), "tone": handle.tone},
+        )
         with self._request_lock:
             self._pending_requests = [
                 request
@@ -521,7 +551,17 @@ class GPTSoVITSTTSProvider(QObject):
             return False, messages[-1] if messages else "GPT-SoVITS 服务不可用。"
         if not self._ensure_character_weights(messages.append):
             return False, messages[-1] if messages else "GPT-SoVITS 角色权重加载失败。"
-        return True, "TTS 服务已就绪。"
+        if (
+            self._active_precision == TTS_PRECISION_FP16
+            and not self._precision_probe_completed
+        ):
+            self._precision_probe_completed = True
+            if not self._probe_precision_audio():
+                if not self._try_fp32_fallback():
+                    return False, "GPT-SoVITS FP16 预热失败。"
+                if not self._ensure_character_weights(messages.append):
+                    return False, messages[-1] if messages else "GPT-SoVITS FP32 回退失败。"
+        return True, f"TTS 服务已就绪（{self._active_precision.upper()}）。"
 
     def _queue_request(self, request: _TTSRequest) -> None:
         with self._request_lock:
@@ -531,7 +571,7 @@ class GPTSoVITSTTSProvider(QObject):
             "TTS",
             "请求加入队列",
             {
-                "text": request.text,
+                **_text_debug_payload(request.text),
                 "tone": request.tone,
                 "prepared": request.prepared_audio is not None,
                 "pending_count": pending_count,
@@ -550,7 +590,7 @@ class GPTSoVITSTTSProvider(QObject):
             "TTS",
             "开始处理队列请求",
             {
-                "text": request.text,
+                **_text_debug_payload(request.text),
                 "tone": request.tone,
                 "prepared": request.prepared_audio is not None,
             },
@@ -563,9 +603,14 @@ class GPTSoVITSTTSProvider(QObject):
         thread.start()
 
     def _request_audio(self, tts_request: _TTSRequest) -> None:
+        started_at = time.perf_counter()
         try:
             if tts_request.prepared_audio is not None and tts_request.prepared_audio.cancelled:
-                debug_log("TTS", "请求已取消，跳过音频生成", {"text": tts_request.text})
+                debug_log(
+                    "TTS",
+                    "请求已取消，跳过音频生成",
+                    _text_debug_payload(tts_request.text),
+                )
                 return
 
             fail = lambda message: self._fail_audio_request(tts_request, message)
@@ -576,8 +621,9 @@ class GPTSoVITSTTSProvider(QObject):
                 return
 
             reference = self._select_reference(tts_request.tone)
+            request_text = sanitize_tts_text(tts_request.text)
             payload = {
-                "text": tts_request.text,
+                "text": request_text,
                 "text_lang": _resolve_request_text_lang(
                     tts_request.text,
                     self.settings.text_lang,
@@ -585,7 +631,7 @@ class GPTSoVITSTTSProvider(QObject):
                 "ref_audio_path": str(reference.ref_audio_path),
                 "prompt_text": reference.ref_text,
                 "prompt_lang": reference.ref_lang,
-                "text_split_method": "cut1",
+                "text_split_method": "cut5",
                 "batch_size": 1,
                 "media_type": "wav",
                 "streaming_mode": False,
@@ -599,14 +645,16 @@ class GPTSoVITSTTSProvider(QObject):
                 "发送 GPT-SoVITS 请求",
                 {
                     "api_url": self.settings.api_url,
-                    "text": tts_request.text,
+                    "text_chars": len(request_text),
+                    "text_fingerprint": _text_fingerprint(request_text),
+                    "precision": self._active_precision,
+                    "split_method": "cut5",
                     "tone": tts_request.tone,
                     "reference": {
                         "tone": reference.tone,
                         "ref_audio_path": reference.ref_audio_path,
                         "ref_lang": reference.ref_lang,
                     },
-                    "payload": payload,
                 },
             )
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -623,16 +671,24 @@ class GPTSoVITSTTSProvider(QObject):
                     timeout=self.settings.timeout_seconds,
                 ) as response:
                     audio_data = response.read()
+                    if not _is_valid_wav(audio_data):
+                        raise ValueError("GPT-SoVITS 返回的 WAV 无效。")
                     debug_log(
                         "TTS",
                         "GPT-SoVITS 请求成功",
                         {
                             "status": getattr(response, "status", None),
                             "audio_bytes": len(audio_data),
+                            "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                            "queue_wait_ms": int((started_at - tts_request.queued_at) * 1000),
+                            "precision": self._active_precision,
                         },
                     )
             except urllib.error.HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and self._try_fp32_fallback():
+                    self._request_audio(tts_request)
+                    return
                 debug_log(
                     "TTS",
                     "GPT-SoVITS HTTP 失败",
@@ -644,6 +700,9 @@ class GPTSoVITSTTSProvider(QObject):
                 self._fail_audio_request(tts_request, f"GPT-SoVITS HTTP {exc.code}: {error_body}")
                 return
             except urllib.error.URLError as exc:
+                if self._try_fp32_fallback():
+                    self._request_audio(tts_request)
+                    return
                 debug_log("TTS", "GPT-SoVITS 请求失败", {"reason": str(exc.reason)})
                 self._fail_audio_request(
                     tts_request,
@@ -651,8 +710,21 @@ class GPTSoVITSTTSProvider(QObject):
                 )
                 return
             except TimeoutError:
-                debug_log("TTS", "GPT-SoVITS 请求超时")
+                debug_log(
+                    "TTS",
+                    "GPT-SoVITS 请求超时",
+                    {
+                        "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                        "precision": self._active_precision,
+                    },
+                )
                 self._fail_audio_request(tts_request, "GPT-SoVITS 请求超时。")
+                return
+            except ValueError as exc:
+                if self._try_fp32_fallback():
+                    self._request_audio(tts_request)
+                    return
+                self._fail_audio_request(tts_request, str(exc))
                 return
 
             if not audio_data:
@@ -676,6 +748,75 @@ class GPTSoVITSTTSProvider(QObject):
             with self._request_lock:
                 self._request_running = False
             self._start_next_request()
+
+    def _try_fp32_fallback(self) -> bool:
+        if (
+            self.settings.precision_mode != TTS_PRECISION_AUTO
+            or self._active_precision != TTS_PRECISION_FP16
+            or self._precision_fallback_used
+            or self.settings.work_dir is None
+        ):
+            return False
+        self._precision_fallback_used = True
+        debug_log("TTS", "FP16 推理异常，重启服务并回退 FP32", {"fallback": True})
+        self._stop_local_service()
+        self._active_precision = TTS_PRECISION_FP32
+        self._service_checked = False
+        self._weights_ready = False
+        return self._ensure_service_available(lambda message: debug_log("TTS", "FP32 回退启动失败", {"message": message}))
+
+    def _probe_precision_audio(self) -> bool:
+        """用短句验证服务确实生成了有声 WAV，而不是吞掉异常后返回静音占位。"""
+
+        reference = self._select_reference(DEFAULT_TONE)
+        payload = {
+            "text": "準備できたよ。",
+            "text_lang": "ja",
+            "ref_audio_path": str(reference.ref_audio_path),
+            "prompt_text": reference.ref_text,
+            "prompt_lang": reference.ref_lang,
+            "text_split_method": "cut5",
+            "batch_size": 1,
+            "media_type": "wav",
+            "streaming_mode": False,
+        }
+        request = urllib.request.Request(
+            url=self.settings.api_url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        started_at = time.perf_counter()
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self.settings.timeout_seconds,
+            ) as response:
+                audio_data = response.read()
+        except Exception as exc:  # noqa: BLE001
+            debug_log(
+                "TTS",
+                "精度预热请求失败",
+                {
+                    "precision": self._active_precision,
+                    "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return False
+
+        valid_audio = _is_valid_wav(audio_data)
+        debug_log(
+            "TTS",
+            "精度预热完成",
+            {
+                "precision": self._active_precision,
+                "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                "audio_bytes": len(audio_data),
+                "valid_audio": valid_audio,
+            },
+        )
+        return valid_audio
 
     def _ensure_service_available(
         self,
@@ -705,9 +846,16 @@ class GPTSoVITSTTSProvider(QObject):
         probe_purpose = "pre_start_check" if self.settings.work_dir is not None else "availability_check"
         if GPTSoVITSTTSProvider._probe_service_port(self, host, port, timeout, purpose=probe_purpose):
             GPTSoVITSTTSProvider._adopt_existing_local_service(self, host, port)
-            self._service_checked = True
-            debug_log("TTS", "服务探测成功", {"api_url": self.settings.api_url})
-            return True
+            if not GPTSoVITSTTSProvider._existing_service_requires_precision_restart(self):
+                self._service_checked = True
+                debug_log("TTS", "服务探测成功", {"api_url": self.settings.api_url})
+                return True
+            debug_log(
+                "TTS",
+                "现有服务精度配置不匹配，准备重启",
+                {"precision": self._active_precision},
+            )
+            self._stop_local_service()
 
         if self.settings.work_dir is None:
             fail_callback(f"GPT-SoVITS 服务不可用，请先启动或检查地址 {self.settings.api_url}。")
@@ -742,6 +890,17 @@ class GPTSoVITSTTSProvider(QObject):
             f"请查看启动日志：{_local_tts_service_log_path(self.settings.provider)}"
         )
         return False
+
+    def _existing_service_requires_precision_restart(self) -> bool:
+        process = getattr(self, "_server_process", None)
+        if process is None or self.settings.work_dir is None:
+            return False
+        command_line = _query_process_command_line(process.pid)
+        if not command_line:
+            return False
+        precision = getattr(self, "_active_precision", _preferred_tts_precision(self.settings))
+        expected = f"gpt_sovits_{precision}.yaml"
+        return expected not in command_line
 
     def _adopt_existing_local_service(self, host: str, port: int) -> None:
         current = getattr(self, "_server_process", None)
@@ -845,7 +1004,16 @@ class GPTSoVITSTTSProvider(QObject):
                 log_file.flush()
                 kwargs["stdout"] = log_file
                 self._server_process = subprocess.Popen(
-                    _build_gpt_sovits_start_command(python_exe, api_script, self.settings),
+                    _build_gpt_sovits_start_command(
+                        python_exe,
+                        api_script,
+                        self.settings,
+                        precision=getattr(
+                            self,
+                            "_active_precision",
+                            _preferred_tts_precision(self.settings),
+                        ),
+                    ),
                     **kwargs,
                 )
         except OSError as exc:
@@ -860,6 +1028,11 @@ class GPTSoVITSTTSProvider(QObject):
                 "work_dir": str(work_dir),
                 "pid": self._server_process.pid,
                 "log_path": str(_local_tts_service_log_path(self.settings.provider)),
+                "precision": getattr(
+                    self,
+                    "_active_precision",
+                    _preferred_tts_precision(self.settings),
+                ),
             },
         )
         return True
@@ -1016,7 +1189,7 @@ class GPTSoVITSTTSProvider(QObject):
             "TTS",
             "预生成音频已就绪",
             {
-                "text": handle.text,
+                **_text_debug_payload(handle.text),
                 "tone": handle.tone,
                 "audio_path": path,
                 "play_requested": handle.play_requested,
@@ -1098,7 +1271,7 @@ class GPTSoVITSTTSProvider(QObject):
             "TTS",
             "预生成音频加入播放队列",
             {
-                "text": handle.text,
+                **_text_debug_payload(handle.text),
                 "tone": handle.tone,
                 "audio_path": handle.audio_path,
                 "pending_audio": len(self._pending_audio),
@@ -1615,22 +1788,44 @@ def _find_running_local_tts_process(
     settings: GPTSoVITSTTSSettings,
     port: int,
 ) -> _AttachedLocalProcess | None:
-    if sys.platform != "win32" or settings.work_dir is None:
+    if settings.work_dir is None:
         return None
-    if settings.provider not in {TTS_PROVIDER_GPT_SOVITS, TTS_PROVIDER_GENIE}:
+    if settings.provider not in {
+        TTS_PROVIDER_GPT_SOVITS,
+        TTS_PROVIDER_CUSTOM_GPT_SOVITS,
+        TTS_PROVIDER_GENIE,
+    }:
         return None
 
     pid = _find_listening_tcp_pid(port)
     if pid is None or pid == os.getpid():
         return None
 
-    command_line = _query_windows_process_command_line(pid)
+    command_line = _query_process_command_line(pid)
     if not command_line or not _command_line_matches_local_tts(settings, command_line, port):
         return None
     return _AttachedLocalProcess(pid)
 
 
 def _find_listening_tcp_pid(port: int) -> int | None:
+    if sys.platform != "win32":
+        try:
+            result = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        for line in result.stdout.splitlines():
+            try:
+                return int(line.strip())
+            except ValueError:
+                continue
+        return None
     try:
         result = subprocess.run(
             ["netstat", "-ano", "-p", "tcp"],
@@ -1698,6 +1893,23 @@ def _query_windows_process_command_line(pid: int) -> str | None:
     return result.stdout.strip() or None
 
 
+def _query_process_command_line(pid: int) -> str | None:
+    if sys.platform == "win32":
+        return _query_windows_process_command_line(pid)
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", "command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() or None
+
+
 def _command_line_matches_local_tts(
     settings: GPTSoVITSTTSSettings,
     command_line: str,
@@ -1716,7 +1928,7 @@ def _command_line_matches_local_tts(
     if settings.provider == TTS_PROVIDER_GENIE:
         return "genie_tts.start_server" in normalized_command and f"port={int(port)}" in normalized_command
 
-    if settings.provider == TTS_PROVIDER_GPT_SOVITS:
+    if settings.provider in {TTS_PROVIDER_GPT_SOVITS, TTS_PROVIDER_CUSTOM_GPT_SOVITS}:
         api_script = _normalize_process_text(str(work_dir.resolve() / "api_v2.py"))
         return api_script in normalized_command
 
@@ -1814,10 +2026,18 @@ def _build_gpt_sovits_start_command(
     python_exe: Path,
     api_script: Path,
     settings: GPTSoVITSTTSSettings,
+    *,
+    precision: str | None = None,
 ) -> list[str]:
     cmd = [str(python_exe), str(api_script)]
     if settings.tts_config_path is not None:
-        cmd.extend(["-c", str(settings.tts_config_path)])
+        config_path = settings.tts_config_path
+        if config_path.is_file():
+            config_path = _build_runtime_tts_config(
+                settings,
+                precision or settings.precision_mode,
+            )
+        cmd.extend(["-c", str(config_path)])
 
     parsed_url = urlparse(settings.api_url)
     if parsed_url.hostname:
@@ -1830,6 +2050,119 @@ def _build_gpt_sovits_start_command(
     if port is not None:
         cmd.extend(["-p", str(port)])
     return cmd
+
+
+def _build_runtime_tts_config(
+    settings: GPTSoVITSTTSSettings,
+    precision: str,
+) -> Path:
+    source = settings.tts_config_path
+    if source is None:
+        raise TTSConfigError("缺少 GPT-SoVITS 推理配置。")
+    data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    custom = dict(data.get("custom") or {})
+    custom["is_half"] = precision == TTS_PRECISION_FP16
+    data["custom"] = custom
+    root = _find_project_root(settings.work_dir or source.parent)
+    target_dir = root / "runtime" / "tts"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"gpt_sovits_{precision}.yaml"
+    target.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return target
+
+
+def _preferred_tts_precision(settings: GPTSoVITSTTSSettings) -> str:
+    if settings.precision_mode in {TTS_PRECISION_FP16, TTS_PRECISION_FP32}:
+        return settings.precision_mode
+    source = settings.tts_config_path
+    if source is None:
+        return TTS_PRECISION_FP32
+    try:
+        data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+        device = str((data.get("custom") or {}).get("device", "")).strip().lower()
+    except (OSError, yaml.YAMLError, AttributeError):
+        return TTS_PRECISION_FP32
+    return TTS_PRECISION_FP16 if device in {"mps", "cuda"} else TTS_PRECISION_FP32
+
+
+def _find_project_root(path: Path) -> Path:
+    candidate = path.resolve()
+    for parent in (candidate, *candidate.parents):
+        if (parent / "main.py").is_file() and (parent / "app").is_dir():
+            return parent
+    return Path.cwd()
+
+
+def _text_fingerprint(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _text_debug_payload(text: str) -> dict[str, object]:
+    return {
+        "text_chars": len(text),
+        "text_fingerprint": _text_fingerprint(text),
+    }
+
+
+def _is_valid_wav(data: bytes) -> bool:
+    if len(data) < 44:
+        return False
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wav_file:
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            frame_rate = wav_file.getframerate()
+            frame_count = wav_file.getnframes()
+            if (
+                channels <= 0
+                or sample_width != 2
+                or frame_rate <= 0
+                or frame_count <= 0
+            ):
+                return False
+            probe_frames = wav_file.readframes(min(frame_count, frame_rate * 2))
+            samples = array.array("h")
+            samples.frombytes(probe_frames)
+            if sys.byteorder != "little":
+                samples.byteswap()
+            return bool(samples) and max(abs(sample) for sample in samples) > 8
+    except (EOFError, wave.Error):
+        return False
+
+
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_PATH_RE = re.compile(r"(?:/[A-Za-z0-9._~@%+\-=]+){2,}")
+_BACKTICK_RE = re.compile(r"`[^`\n]{2,}`")
+_QUOTED_RE = re.compile(r"([「『])(.{8,}?)([」』])")
+
+
+def sanitize_tts_text(text: str) -> str:
+    """缩短不适合日语语音模型逐字朗读的路径、命令和非日语引用。"""
+    cleaned = " ".join(text.split())
+    cleaned = _URL_RE.sub("ウェブアドレス", cleaned)
+    cleaned = _PATH_RE.sub("ファイルパス", cleaned)
+    cleaned = _BACKTICK_RE.sub("コマンド", cleaned)
+
+    def replace_quote(match: re.Match[str]) -> str:
+        content = match.group(2)
+        if _looks_non_japanese_quote(content):
+            return f"{match.group(1)}画面上のテキスト{match.group(3)}"
+        return match.group(0)
+
+    return _QUOTED_RE.sub(replace_quote, cleaned)
+
+
+def _looks_non_japanese_quote(text: str) -> bool:
+    has_kana = any(
+        "\u3040" <= char <= "\u30ff" or "\uff66" <= char <= "\uff9f"
+        for char in text
+    )
+    chinese_punctuation = any(char in text for char in "，？！；：")
+    ascii_words = len(re.findall(r"[A-Za-z]{3,}", text))
+    return not has_kana and (chinese_punctuation or ascii_words >= 2)
 
 
 def _probe_tcp_port(host: str, port: int, timeout: int) -> bool:

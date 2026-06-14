@@ -8,7 +8,7 @@ from app.agent.mcp.settings import MCPRuntimeSettings
 from app.config.character_loader import CharacterRegistry
 from app.config.settings_service import AppSettingsService, DebugLogSettings
 from app.config.yaml_config import load_yaml_mapping
-from app.llm.api_client import ApiSettings
+from app.llm.api_client import ApiSettings, VisionApiSettings
 from app.agent.proactive_care import ProactiveCareSettings
 from app.ui.theme import (
     DEFAULT_THEME_SETTINGS,
@@ -18,7 +18,12 @@ from app.ui.theme import (
     build_pet_window_stylesheet,
     parse_ai_theme_response,
 )
-from app.voice.tts import TTS_PROVIDER_CUSTOM_GPT_SOVITS, TTS_PROVIDER_NONE, GPTSoVITSTTSSettings
+from app.voice.tts import (
+    TTS_PRECISION_FP16,
+    TTS_PROVIDER_CUSTOM_GPT_SOVITS,
+    TTS_PROVIDER_NONE,
+    GPTSoVITSTTSSettings,
+)
 
 
 class CharacterRegistryStub:
@@ -40,6 +45,7 @@ llm:
   base_url: https://yaml.example/v1
   api_key: yaml-key
   model: yaml-model
+  vision_model: yaml-vision-model
   timeout_seconds: 12
 """.lstrip(),
         encoding="utf-8",
@@ -52,6 +58,7 @@ llm:
         api_key="yaml-key",
         model="yaml-model",
         timeout_seconds=12,
+        vision_model="yaml-vision-model",
     )
 
 
@@ -67,6 +74,15 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
             timeout_seconds=30,
         )
     )
+    service.save_vision_api_settings(
+        VisionApiSettings(
+            enabled=True,
+            base_url="https://vision.example/v1",
+            api_key="vision-secret",
+            model="vision-model",
+            timeout_seconds=20,
+        )
+    )
     service.save_tts_settings(
         GPTSoVITSTTSSettings(
             enabled=True,
@@ -78,6 +94,7 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
             ref_lang="ja",
             text_lang="ja",
             timeout_seconds=22,
+            precision_mode=TTS_PRECISION_FP16,
         )
     )
     service.save_current_character_id(CharacterRegistryStub(), "nanami")  # type: ignore[arg-type]
@@ -98,15 +115,44 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
     system = load_yaml_mapping(service.system_config_path)
 
     assert api["llm"]["model"] == "demo-model"
+    assert "vision_model" not in api["llm"]
+    assert api["vision"]["enabled"] is True
+    assert api["vision"]["model"] == "vision-model"
     assert api["tts"]["provider"] == "gpt-sovits"
     assert api["tts"]["gpt_sovits"]["work_dir"] == "tts/gpt"
     assert api["tts"]["gpt_sovits"]["timeout_seconds"] == 22
+    assert api["tts"]["gpt_sovits"]["precision_mode"] == TTS_PRECISION_FP16
     assert characters["current_character_id"] == "nanami"
     assert system["mcp"]["windows_enabled"] is False
     assert system["debug"]["enabled"] is True
     assert system["debug"]["body_enabled"] is True
     assert system["debug"]["file_enabled"] is True
     assert system["proactive_care"]["check_interval_minutes"] == 5
+
+
+def test_settings_service_migrates_legacy_vision_model() -> None:
+    root = _runtime_root("legacy_vision")
+    service = AppSettingsService(root)
+    service.api_config_path.parent.mkdir(parents=True)
+    service.api_config_path.write_text(
+        """
+llm:
+  base_url: https://legacy.example/v1
+  api_key: legacy-key
+  model: text-model
+  vision_model: legacy-vision-model
+  timeout_seconds: 15
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    assert service.load_vision_api_settings() == VisionApiSettings(
+        enabled=True,
+        base_url="https://legacy.example/v1",
+        api_key="legacy-key",
+        model="legacy-vision-model",
+        timeout_seconds=15,
+    )
 
 
 def test_settings_service_loads_tts_work_dir_and_keeps_legacy_blank() -> None:

@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from app.llm.chinese_text import to_simplified_chinese
 
 DEFAULT_TONE = "中性"
 SAFE_PARSE_FAILURE_TEXT = "返答の形が少し崩れたみたい。もう一度整理するね。"
@@ -35,7 +36,7 @@ class ChatSegment:
             translation = zh
         object.__setattr__(self, "text", text)
         object.__setattr__(self, "tone", tone)
-        object.__setattr__(self, "translation", translation)
+        object.__setattr__(self, "translation", to_simplified_chinese(translation))
         object.__setattr__(self, "portrait", portrait)
 
     def display_text(self, subtitle_language: str) -> str:
@@ -151,9 +152,15 @@ def _parse_segment(item: Any) -> tuple[ChatSegment | None, bool]:
         return None, False
 
     text = _clean_first_text(item, "ja", "japanese", "text")
-    if not text:
-        return None, False
     translation = _clean_first_text(item, "zh", "chinese", "translation")
+    if not text and not translation:
+        return None, False
+    if not text:
+        # 叙述段：ja 为空、zh 有内容，仅显示不朗读
+        # 防御：若 zh 假名占比 > 50%，说明模型误将日文写入了叙述段
+        if _kana_ratio(translation) > 0.5:
+            return (ChatSegment("", item.get("tone"), "", item.get("portrait")), False)
+        return ChatSegment("", item.get("tone"), translation, item.get("portrait")), False
     return _build_segment(text, item.get("tone"), translation, item.get("portrait"))
 
 
@@ -177,7 +184,42 @@ def _build_segment(text: str, tone: Any, translation: str, portrait: Any) -> tup
             True,
         )
 
+    # 台词段（ja 非空）必须有非空简体中文 zh 译文。
+    # 亲昵/情感强烈场景下模型常只写 ja 不写 zh，导致中文字幕回退显示日语。
+    # 这里把"台词段 zh 缺失或只含日文假名"标记为语言问题，触发一次模型修复重试；
+    # 即便修复失败，display_text 也会用中文兜底而非显示日语。
+    if text and not _has_valid_chinese_translation(translation):
+        return (
+            ChatSegment(
+                text,
+                _clean_tone(tone),
+                translation or _chinese_fallback_for_japanese(text),
+                _clean_portrait(portrait),
+            ),
+            True,
+        )
+
     return ChatSegment(text, _clean_tone(tone), translation, _clean_portrait(portrait)), False
+
+
+def _has_valid_chinese_translation(translation: str) -> bool:
+    """判断 zh 译文是否是合格的简体中文（非空、且不全是日文假名/汉字）。"""
+    if not translation.strip():
+        return False
+    # 假名占比过高说明模型把日文写进了 zh。
+    if _kana_ratio(translation) > 0.3:
+        return False
+    return True
+
+
+def _chinese_fallback_for_japanese(japanese_text: str) -> str:
+    """台词段 zh 缺失时的中文兜底，避免字幕显示日语。
+
+    不做真实翻译（翻译是模型的职责，这里已触发重试），只给一句明确提示，
+    让用户知道这条台词缺少中文译文，而不是看到看不懂的日语。
+    """
+    _ = japanese_text  # 仅占位，不展开翻译。
+    return "（此句台词缺少中文译文，请稍候）"
 
 
 def _clean_tone(value: Any) -> str:
@@ -227,6 +269,15 @@ def _has_obvious_chinese(value: str) -> bool:
     ) or sum(1 for char in value if char in common_chinese_chars) >= 2 or any(
         char in simplified_only_chars for char in value
     )
+
+
+def _kana_ratio(value: str) -> float:
+    """假名占文本总字符的比例。"""
+    total = len(value)
+    if total == 0:
+        return 0.0
+    kana = sum(1 for char in value if "\u3040" <= char <= "\u30ff" or "\uff66" <= char <= "\uff9f")
+    return kana / total
 
 
 def _try_load_json(content: str) -> tuple[Any | None, bool]:
@@ -317,5 +368,4 @@ def _build_safe_parse_failure_reply() -> ChatReply:
             )
         ]
     )
-
 

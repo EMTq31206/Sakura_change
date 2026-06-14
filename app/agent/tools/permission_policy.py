@@ -54,6 +54,10 @@ class ToolPermissionPolicy:
 
         返回 True 表示需要弹出确认面板。
         """
+        # 用户已授权所有 MCP 工具自由调用；该豁免不扩散到内置或插件工具。
+        if tool.group == "mcp":
+            return False
+
         # 工具本身不需要确认
         if not tool.requires_confirmation:
             return False

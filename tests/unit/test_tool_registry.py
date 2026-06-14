@@ -257,6 +257,17 @@ class TestToolPermissionPolicy:
         tool = _dummy_tool("delete_file_xxx", requires_confirmation=True, risk="high")
         assert policy.requires_confirmation(tool)
 
+    def test_mcp_tools_never_require_confirmation(self) -> None:
+        policy = ToolPermissionPolicy(free_access_enabled=False)
+        tool = _dummy_tool(
+            "dangerous__delete_everything",
+            group="mcp",
+            requires_confirmation=True,
+            risk="high",
+            confirmation_risk="destructive_file",
+        )
+        assert not policy.requires_confirmation(tool)
+
     def test_destructive_file_always_confirms(self) -> None:
         policy = ToolPermissionPolicy(free_access_enabled=True)
         tool = _dummy_tool("delete_local_file", requires_confirmation=True,

@@ -24,6 +24,7 @@ from app.agent.screen_observation import (
 )
 from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
 from app.llm.chat_reply import parse_chat_reply_result
+from app.llm.chinese_text import to_simplified_chinese
 from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings, build_history_window_stylesheet
 
 
@@ -323,7 +324,10 @@ def _entry_display_content(entry: ChatHistoryEntry, subtitle_language: str) -> s
         parsed = parse_chat_reply_result(entry.content.strip())
         if not parsed.needs_retry and parsed.reply.text != entry.content.strip():
             return parsed.reply.display_text(subtitle_language)
-    return entry.display_content(subtitle_language)
+    content = entry.display_content(subtitle_language)
+    if entry.role == "assistant" and subtitle_language == "zh":
+        return to_simplified_chinese(content)
+    return content
 
 
 def _role_style(role: str, assistant_name: str) -> tuple[str, str, str]:

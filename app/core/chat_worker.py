@@ -38,6 +38,7 @@ class ChatWorker(QObject):
         self.pipeline = ChatPipeline(
             agent_runtime,
             visual_observation_store=visual_observation_store,
+            character_dir=getattr(agent_runtime, "character_dir", None),
         )
 
     @Slot()
@@ -112,6 +113,7 @@ class EventWorker(QObject):
             pipeline = ChatPipeline(
                 self.agent_runtime,
                 visual_observation_store=self.visual_observation_store,
+                character_dir=getattr(self.agent_runtime, "character_dir", None),
             )
             result = pipeline.run_event(
                 self.agent_event,

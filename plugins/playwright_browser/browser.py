@@ -5,8 +5,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, TypeVar
-from urllib.parse import quote_plus
 
+from app.agent.web_search import build_bing_search_url, search_bing_rss
 from plugins.playwright_browser.config_model import default_config_path, load_config
 
 
@@ -51,25 +51,20 @@ def get_text(selector: str = "body") -> str:
 
 
 def search_web(query: str, limit: int = 5) -> str:
-    """用 Playwright 打开 DuckDuckGo HTML 搜索页并整理结果。"""
+    """用 Playwright 打开 Bing 搜索页，并通过 RSS 返回稳定结果。"""
 
     def task() -> str:
         page = _ensure_browser()
-        page.goto(f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", wait_until="domcontentloaded")
+        page.goto(build_bing_search_url(query), wait_until="domcontentloaded")
         results: list[str] = []
-        for index, item in enumerate(page.query_selector_all(".result__body")[: max(1, limit)], start=1):
-            title = _inner_text(item, ".result__title")
-            snippet = _inner_text(item, ".result__snippet")
-            display_url = _inner_text(item, ".result__url")
-            link = item.query_selector(".result__a")
-            href = link.get_attribute("href") if link is not None else ""
-            parts = [f"{index}. {title}".strip()]
-            if snippet:
-                parts.append(snippet)
-            if display_url:
-                parts.append(display_url)
-            if href:
-                parts.append(href)
+        for index, item in enumerate(
+            search_bing_rss(query, max_results=max(1, limit)),
+            start=1,
+        ):
+            parts = [f"{index}. {item.title}".strip()]
+            if item.snippet:
+                parts.append(item.snippet)
+            parts.append(item.url)
             results.append("\n".join(part for part in parts if part.strip()))
         return "\n\n".join(results) if results else "没有找到可用搜索结果。"
 
@@ -221,15 +216,5 @@ def _shutdown_browser_objects() -> None:
 def _safe_title(page: Any) -> str:
     try:
         return str(page.title())
-    except Exception:
-        return ""
-
-
-def _inner_text(item: Any, selector: str) -> str:
-    element = item.query_selector(selector)
-    if element is None:
-        return ""
-    try:
-        return str(element.inner_text()).strip()
     except Exception:
         return ""

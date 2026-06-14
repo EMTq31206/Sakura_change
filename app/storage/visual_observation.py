@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from app.core.debug_log import debug_log
 
 VISUAL_OBSERVATION_RECENT_MINUTES = 10
 VISUAL_OBSERVATION_RETENTION_DAYS = 7
@@ -49,10 +51,11 @@ class VisualObservationRecord:
     width: int
     height: int
     summary: str
-    visible_texts: list[str]
-    uncertain_texts: list[str]
-    notable_elements: list[str]
-    confidence: float
+    visual_context: str = ""
+    visible_texts: list[str] = field(default_factory=list)
+    uncertain_texts: list[str] = field(default_factory=list)
+    notable_elements: list[str] = field(default_factory=list)
+    confidence: float = 0.0
     sensitive_redacted: bool = False
 
 
@@ -168,9 +171,13 @@ def summarize_visual_observation(
     image_parts = _job_image_parts(job)
     if not image_parts:
         return fallback
+    if api_client is None:
+        return _fallback_record(job, metadata, "视觉摘要生成失败：独立视觉模型未启用。")
 
+    started_at = time.perf_counter()
     try:
-        content = api_client.complete_raw(
+        complete_vision = getattr(api_client, "complete_vision_raw", api_client.complete_raw)
+        content = complete_vision(
             _build_visual_summary_prompt(),
             [
                 {
@@ -184,7 +191,9 @@ def summarize_visual_observation(
                     ],
                 }
             ],
-            temperature=0.2,
+            temperature=0,
+            max_tokens=1024,
+            response_format={"type": "json_object"},
         )
     except Exception as exc:
         return _fallback_record(job, metadata, f"视觉摘要生成失败：{exc}")
@@ -194,6 +203,15 @@ def summarize_visual_observation(
         return _fallback_record(job, metadata, "视觉摘要返回格式无法解析。")
 
     record, redacted = _record_from_summary(job, metadata, parsed)
+    debug_log(
+        "Vision",
+        "视觉摘要完成",
+        {
+            "source": job.source,
+            "image_count": len(image_parts),
+            "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+        },
+    )
     if redacted:
         return VisualObservationRecord(
             **{
@@ -202,6 +220,70 @@ def summarize_visual_observation(
             }
         )
     return record
+
+
+def replace_images_with_visual_context(
+    messages: list[dict[str, Any]],
+    records: list[VisualObservationRecord],
+) -> list[dict[str, Any]]:
+    """移除原始图片，并把视觉模型的结构化结果作为文本上下文注入。"""
+    stripped: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            stripped.append(message)
+            continue
+        text_parts = [
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        stripped.append({**message, "content": "\n".join(text_parts).strip()})
+    if not records:
+        return stripped
+    context = build_visual_context_message("当前请求附带的屏幕图片", records)
+    return [context, *stripped] if context is not None else stripped
+
+
+def summarize_image_data_urls(
+    api_client: Any,
+    image_urls: list[str],
+    *,
+    source: str = "tool_screenshot",
+) -> str:
+    """将工具返回的截图转成可供主模型使用的纯文本观察。"""
+    valid_urls = [
+        url for url in image_urls
+        if isinstance(url, str) and url.startswith("data:image/")
+    ][:3]
+    if not valid_urls:
+        return ""
+    job = VisualObservationJob(
+        id=generate_visual_observation_id(),
+        source=source,
+        user_text="工具返回截图",
+        screen_contexts=[
+            {
+                "data_url": url,
+                "screen_name": source,
+                "width": 0,
+                "height": 0,
+                "captured_at": _now_iso(),
+            }
+            for url in valid_urls
+        ],
+    )
+    record = summarize_visual_observation(api_client, job)
+    if record.confidence <= 0 or record.summary.startswith("视觉摘要生成失败"):
+        return f"截图视觉解析失败：{record.summary}"
+    return "\n".join(
+        [
+            f"截图摘要：{record.summary}",
+            f"可见文字：{_format_list(record.visible_texts)}",
+            f"关键元素：{_format_list(record.notable_elements)}",
+            f"视觉置信度：{record.confidence:.2f}",
+        ]
+    )
 
 
 def build_visual_context_message(
@@ -222,6 +304,7 @@ def build_visual_context_message(
                     f"- visual_id={record.id} source={record.source} time={record.created_at}",
                     f"  屏幕：{record.screen_name}，尺寸：{record.width}x{record.height}，置信度：{record.confidence:.2f}",
                     f"  摘要：{record.summary or '无摘要'}",
+                    f"  画面布局：{record.visual_context or '未知'}",
                     f"  可见文字/台词：{_format_list(record.visible_texts)}",
                     f"  不确定文字：{_format_list(record.uncertain_texts)}",
                     f"  关键元素：{_format_list(record.notable_elements)}",
@@ -238,21 +321,26 @@ def should_inject_visual_context(user_text: str) -> bool:
 
 def _build_visual_summary_prompt() -> str:
     return """
-你是桌面 Agent 的视觉观察整理器。你只负责把截图转成后续对话可检索的短期视觉记忆，并且只输出 JSON。
-不要输出 Markdown，不要解释，不要生成角色回复。
+你是桌面 Agent 的视觉观察整理器。你把截图转成结构化视觉记忆，只输出 JSON，不要 Markdown，不要解释。
 
-提取重点：
-- 屏幕里明确可见的台词、字幕、聊天气泡、窗口标题、按钮文字、错误信息、代码片段。
-- 用户可能追问的对象、位置、状态和关键界面元素。
-- 看不清或不确定的文字放入 uncertain_texts，不要强行猜。
-- 遇到 API Key、token、密码、身份证、银行卡等敏感内容，必须打码为 [REDACTED]，并把 sensitive_redacted 设为 true。
+第一步：理解画面全貌（最重要）
+- 当前活跃的是什么应用/窗口？（浏览器、代码编辑器、游戏、视频播放器、聊天、终端、文件管理器、桌面等）
+- 画面上有哪些可见的窗口层级？各自位置和大致占比？
+- 是什么类型的场景？（写代码、调试、看视频、打游戏、刷网页、聊天、读文档等）
+- 画面中是否有图片、视频、头像、图标、表情包、游戏画面、UI 控件等**非文字**视觉元素？尽可能描述它们。
+- 整体色彩/明暗/氛围如何？（深色模式编辑器、明亮网页、暗色调游戏画面等）
 
-只返回如下 JSON：
+第二步：提取可见文字（辅助）
+- 屏幕里明确可见的文字/台词/字幕/聊天气泡/窗口标题/按钮文字/错误信息/代码片段。
+- 遇到 API Key、token、密码、身份证、银行卡等敏感内容，打码为 [REDACTED]。
+
+第三步：只返回如下 JSON：
 {
-  "summary": "一句到三句话概括画面",
-  "visible_texts": ["明确可见文字或台词"],
-  "uncertain_texts": ["不确定或部分可见文字"],
-  "notable_elements": ["关键窗口、控件、人物、状态"],
+  "summary": "用 3-5 句话描述画面：什么应用、什么内容类型、有哪些视觉元素、用户在做什么",
+  "visual_context": "画面布局简述：各个窗口/区域的位置、大小、类型",
+  "visible_texts": ["明确可见的文字"],
+  "uncertain_texts": ["不确定或部分可见的文字"],
+  "notable_elements": ["关键窗口、控件、人物、图标、图片、视频、按钮等"],
   "confidence": 0.0,
   "sensitive_redacted": false
 }
@@ -294,7 +382,7 @@ def _job_image_parts(job: VisualObservationJob) -> list[dict[str, Any]]:
             "type": "image_url",
             "image_url": {
                 "url": image_url,
-                "detail": "low",
+                "detail": "high",
             },
         }
         for image_url in image_urls[:3]
@@ -335,6 +423,7 @@ def _record_from_summary(
     summary: dict[str, Any],
 ) -> tuple[VisualObservationRecord, bool]:
     summary_text, summary_redacted = _redact_text(_text_value(summary.get("summary")))
+    visual_context, visual_redacted = _redact_text(_text_value(summary.get("visual_context")))
     visible_texts, visible_redacted = _redact_text_list(summary.get("visible_texts"))
     uncertain_texts, uncertain_redacted = _redact_text_list(summary.get("uncertain_texts"))
     notable_elements, notable_redacted = _redact_text_list(summary.get("notable_elements"))
@@ -349,6 +438,7 @@ def _record_from_summary(
             width=metadata["width"],
             height=metadata["height"],
             summary=summary_text,
+            visual_context=visual_context,
             visible_texts=visible_texts,
             uncertain_texts=uncertain_texts,
             notable_elements=notable_elements,
@@ -377,6 +467,7 @@ def _fallback_record(
         width=metadata["width"],
         height=metadata["height"],
         summary=summary,
+        visual_context="",
         visible_texts=[],
         uncertain_texts=[],
         notable_elements=[],

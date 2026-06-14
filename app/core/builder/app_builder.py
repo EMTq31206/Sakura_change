@@ -35,7 +35,7 @@ from app.core.app_context import AppContext, CoreServices, FeatureServices, Stor
 from app.core.debug_log import debug_log
 from app.core.extensions import ExtensionRegistry
 from app.core.plugin_manager import SakuraPluginManager
-from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient, VisionApiSettings
 from app.storage.chat_history import ChatHistoryStore
 from app.storage.visual_observation import VisualObservationStore
 from app.voice.tts import TTSProvider
@@ -51,10 +51,12 @@ class AppBuilder:
         self.base_dir = base_dir
         self._settings_service: AppSettingsService | None = None
         self._api_settings: ApiSettings | None = None
+        self._vision_settings: VisionApiSettings | None = None
         self._character_registry: CharacterRegistry | None = None
         self._character_profile: CharacterProfile | None = None
         self._system_prompt: str = ""
         self._api_client: OpenAICompatibleClient | None = None
+        self._vision_client: OpenAICompatibleClient | None = None
         self._tool_registry: ToolRegistry | None = None
         self._tts_provider: TTSProvider | None = None
         self._memory_store: MemoryStore | None = None
@@ -75,6 +77,7 @@ class AppBuilder:
         """加载应用配置 (data/config/*.yaml)。"""
         self._settings_service = AppSettingsService(base_dir=self.base_dir)
         self._api_settings = self._settings_service.load_api_settings()
+        self._vision_settings = self._settings_service.load_vision_api_settings()
         return self
 
     def with_character(self) -> "AppBuilder":
@@ -93,6 +96,11 @@ class AppBuilder:
         if self._api_settings is None:
             self.with_settings()
         self._api_client = OpenAICompatibleClient(self._api_settings)
+        if self._vision_settings is not None and self._vision_settings.is_configured():
+            self._vision_client = OpenAICompatibleClient(
+                self._vision_settings.to_api_settings(),
+                channel="vision",
+            )
         return self
 
     def with_tools(self, tool_registry: ToolRegistry | None = None) -> "AppBuilder":
@@ -193,9 +201,12 @@ class AppBuilder:
             tools=self._tool_registry,
             memory=self._memory_store,
             prompt_patches=self._plugin_manager.prompt_patches if self._plugin_manager else [],
+            vision_client=self._vision_client,
         )
+        agent_runtime.character_dir = self._character_profile.card_path.parent
         core = CoreServices(
             api_client=self._api_client,
+            vision_client=self._vision_client,
             tool_registry=self._tool_registry,
             agent_runtime=agent_runtime,
         )
@@ -229,6 +240,7 @@ class AppBuilder:
             base_dir=self.base_dir,
             settings_service=self._settings_service,
             settings=self._api_settings,
+            vision_settings=self._vision_settings or VisionApiSettings(),
             character_registry=self._character_registry,
             character_profile=self._character_profile,
             system_prompt=self._system_prompt,

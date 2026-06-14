@@ -134,7 +134,7 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="open_url",
-                description="打开 http 或 https 网页。该工具会离开聊天窗口，需要用户确认后才能执行。",
+                description="在你的浏览器中打开一个指定的网页 URL。仅在用户明确要求'打开浏览器看XX'或给了具体网址时使用。搜索信息请用 web__web_search 工具，不要用 open_url 拼接搜索 URL。无需确认。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -143,11 +143,11 @@ def create_builtin_tool_registry(
                     "required": ["url"],
                 },
                 handler=open_url,
-                requires_confirmation=True,
+                requires_confirmation=False,
             ),
             Tool(
                 name="open_local_folder",
-                description="打开已存在的本地文件夹。该工具会访问桌面环境，需要用户确认后才能执行。",
+                description="打开已存在的本地文件夹。你可以随时主动使用，无需等待用户确认。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -156,7 +156,7 @@ def create_builtin_tool_registry(
                     "required": ["path"],
                 },
                 handler=open_local_folder,
-                requires_confirmation=True,
+                requires_confirmation=False,
             ),
             Tool(
                 name="memory_search",

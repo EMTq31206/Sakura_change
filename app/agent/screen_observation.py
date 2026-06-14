@@ -12,13 +12,32 @@ if TYPE_CHECKING:
 
 SCREEN_OBSERVATION_TRIGGER_KEYWORDS = (
     "看屏幕",
+    "看到屏幕",
+    "看得到屏幕",
+    "能看到屏幕",
+    "能看见屏幕",
+    "看得见屏幕",
     "观察屏幕",
     "看看屏幕",
+    "当前屏幕",
+    "屏幕信息",
+    "屏幕内容",
+    "屏幕上有什么",
+    "屏幕里有什么",
+    "看看当前屏幕",
     "看看当前画面",
+    "看到当前画面",
+    "看得到当前画面",
+    "能看到当前画面",
+    "当前画面有什么",
+    "当前界面",
+    "看到当前界面",
+    "能看到当前界面",
     "帮我看这个",
 )
 SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已自主观察屏幕]"
 MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已附加手动框选截图]"
+SCREEN_OBSERVATION_FAILURE_MARKER = "[Sakura 本轮屏幕观察失败]"
 SCREEN_OBSERVATION_MAX_EDGE = 1280
 SCREEN_OBSERVATION_JPEG_QUALITY = 70
 
@@ -58,6 +77,11 @@ def append_manual_observation_marker(
     """给手动框选截图追加历史标记，避免保存 base64 图片。"""
     _ = observation
     return f"{text.rstrip()}\n{_marker_with_visual_id(MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER, visual_id)}"
+
+
+def append_observation_failure_marker(text: str, reason: str) -> str:
+    reason = " ".join(str(reason).split())
+    return f"{text.rstrip()}\n{SCREEN_OBSERVATION_FAILURE_MARKER} 原因：{reason}"
 
 
 def build_screen_observation_user_message(

@@ -78,7 +78,7 @@ class SubtitleController(QObject):
         self.speech_timer.setInterval(self.typing_interval_ms)
 
     def show_segments(self, segments: list[ChatSegment]) -> None:
-        clean_segments = [segment for segment in segments if segment.text.strip()]
+        clean_segments = [segment for segment in segments if segment.text.strip() or segment.translation.strip()]
         if self.is_reply_sequence_active():
             if clean_segments:
                 self.queued_reply_segment_batches.append(clean_segments)
@@ -330,6 +330,7 @@ class SubtitleController(QObject):
 
         self.speech_index += 1
         self.speech_label.setText(self.speech_text[: self.speech_index])
+        self.speech_label.repaint()
         if self.speech_index >= len(self.speech_text):
             self.speech_timer.stop()
             if self.current_segment_sequence_id is not None:

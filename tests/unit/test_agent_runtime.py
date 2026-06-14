@@ -21,6 +21,7 @@ from app.agent.runtime import (
     AgentRuntime,
     _build_vision_unsupported_reply,
     _filter_openai_tools_for_browser_routing,
+    _messages_without_images_for_proactive_fallback,
     _should_block_windows_tool_for_browser_page,
 )
 from app.agent.runtime_limits import (
@@ -34,7 +35,13 @@ from app.agent.runtime_limits import (
     MAX_TOOL_RESULT_CHARS,
 )
 from app.agent.tool_registry import Tool, ToolRegistry
-from app.llm.api_client import ApiRequestError, ChatMessage, NativeToolCall, OpenAICompatibleClient
+from app.llm.api_client import (
+    ApiRequestError,
+    ChatMessage,
+    NativeToolCall,
+    OpenAICompatibleClient,
+    messages_contain_image,
+)
 from app.llm.chat_reply import ChatReply, ChatSegment
 
 
@@ -74,13 +81,13 @@ class TestRuntimeLimits:
     """运行时限制常量验证"""
 
     def test_agent_steps_per_turn_positive(self) -> None:
-        assert MAX_AGENT_STEPS_PER_TURN > 0
+        assert MAX_AGENT_STEPS_PER_TURN == 5
 
     def test_tool_calls_per_step_positive(self) -> None:
-        assert MAX_TOOL_CALLS_PER_STEP > 0
+        assert MAX_TOOL_CALLS_PER_STEP == 4
 
     def test_tool_calls_per_turn_positive(self) -> None:
-        assert MAX_TOOL_CALLS_PER_TURN > 0
+        assert MAX_TOOL_CALLS_PER_TURN == 12
 
     def test_tool_calls_per_turn_at_least_per_step(self) -> None:
         assert MAX_TOOL_CALLS_PER_TURN >= MAX_TOOL_CALLS_PER_STEP
@@ -220,6 +227,55 @@ class TestVisionFallback:
     def test_vision_unsupported_reply_has_segments(self) -> None:
         reply = _build_vision_unsupported_reply()
         assert len(reply.segments) > 0
+
+    def test_proactive_fallback_removes_images_and_keeps_text(self) -> None:
+        messages = _messages_without_images_for_proactive_fallback(
+            [
+                ChatMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "recent_conversation: 学姐？"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,xxx"},
+                        },
+                    ],
+                )
+            ]
+        )
+
+        assert not messages_contain_image(messages)
+        assert "recent_conversation: 学姐？" in messages[0]["content"]
+        assert "不要向用户报告视觉能力错误" in messages[0]["content"]
+
+
+class TestScreenObservationOffer:
+    def test_casual_greeting_does_not_offer_screen_observation(self) -> None:
+        registry = ToolRegistry([_dummy_tool("observe_screen", capability="screen_observation")])
+        runtime = AgentRuntime(_dummy_api_client(), _dummy_system_prompt(), tools=registry)
+
+        result = runtime.handle_user_message([{"role": "user", "content": "学姐？"}])
+
+        assert isinstance(result, AgentResult)
+        call = runtime.api_client.complete_with_tools.call_args_list[0]
+        tool_names = {
+            item["function"]["name"]
+            for item in call.kwargs["tools"]
+        }
+        assert "observe_screen" not in tool_names
+
+    def test_explicit_screen_request_offers_screen_observation(self) -> None:
+        registry = ToolRegistry([_dummy_tool("observe_screen", capability="screen_observation")])
+        runtime = AgentRuntime(_dummy_api_client(), _dummy_system_prompt(), tools=registry)
+
+        runtime.handle_user_message([{"role": "user", "content": "帮我看看当前屏幕"}])
+
+        call = runtime.api_client.complete_with_tools.call_args_list[0]
+        tool_names = {
+            item["function"]["name"]
+            for item in call.kwargs["tools"]
+        }
+        assert "observe_screen" in tool_names
 
     def test_handle_user_message_vision_fallback(self) -> None:
         client = _dummy_api_client()

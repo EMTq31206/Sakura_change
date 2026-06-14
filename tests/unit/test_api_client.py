@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 from typing import Any
 
 from app.llm.api_client import (
@@ -10,6 +11,8 @@ from app.llm.api_client import (
     _build_segmented_reply_instruction,
     _build_chat_completion_payload,
     _filter_supported_chat_params,
+    _normalize_tool_message_sequence,
+    _parse_completion_usage,
 )
 from app.llm.chat_reply import parse_chat_reply
 
@@ -71,6 +74,113 @@ def test_build_chat_payload_keeps_existing_json_keyword() -> None:
     assert payload["messages"][0]["content"] == "Return a JSON object only."
 
 
+def test_normalize_tool_messages_converts_orphan_to_user_context() -> None:
+    messages = _normalize_tool_message_sequence(
+        [
+            {"role": "user", "content": "查一下资料"},
+            {
+                "role": "tool",
+                "tool_call_id": "auto_snapshot_1",
+                "name": "playwright_get_text",
+                "content": '{"text":"Example Page"}',
+            },
+        ]
+    )
+
+    assert messages[1]["role"] == "user"
+    assert "playwright_get_text" in messages[1]["content"]
+    assert "Example Page" in messages[1]["content"]
+
+
+def test_normalize_tool_messages_keeps_complete_native_tool_exchange() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "echo_tool", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "echo_tool",
+            "content": '{"ok":true}',
+        },
+    ]
+
+    assert _normalize_tool_message_sequence(messages) == messages
+
+
+def test_normalize_tool_messages_repairs_incomplete_native_tool_exchange() -> None:
+    messages = _normalize_tool_message_sequence(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "first_tool", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "second_tool", "arguments": "{}"},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "first_tool",
+                "content": '{"ok":true}',
+            },
+        ]
+    )
+
+    assert "tool_calls" not in messages[0]
+    assert messages[1]["role"] == "user"
+
+
+def test_normalize_tool_messages_moves_interleaved_image_after_all_tool_results() -> None:
+    image_message = {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}],
+    }
+    messages = _normalize_tool_message_sequence(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "first_tool", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "second_tool", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"first":true}'},
+            image_message,
+            {"role": "tool", "tool_call_id": "call_2", "content": '{"second":true}'},
+        ]
+    )
+
+    assert [message["role"] for message in messages] == ["assistant", "tool", "tool", "user"]
+    assert messages[-1] == image_message
+
+
 def test_complete_raw_applies_param_filter(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     captured: dict[str, Any] = {}
     client = OpenAICompatibleClient(
@@ -98,6 +208,83 @@ def test_complete_raw_applies_param_filter(monkeypatch) -> None:  # type: ignore
     assert captured["temperature"] == 0.1
     assert captured["max_tokens"] == 8
     assert "unsupported_internal_flag" not in captured
+
+
+def test_complete_vision_raw_uses_configured_vision_model(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="key",
+            model="gemini-3.5-flash",
+            vision_model="gemini-3.1-pro",
+        )
+    )
+
+    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+        captured.update(payload)
+        return {"choices": [{"message": {"content": "seen"}}]}
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    assert client.complete_vision_raw(
+        "system",
+        [{"role": "user", "content": "image"}],
+    ) == "seen"
+    assert captured["model"] == "gemini-3.1-pro"
+
+
+def test_complete_vision_raw_falls_back_to_main_model(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="key",
+            model="gemini-3.1-pro",
+            vision_model="",
+        )
+    )
+
+    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+        captured.update(payload)
+        return {"choices": [{"message": {"content": "seen"}}]}
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    client.complete_vision_raw("system", [{"role": "user", "content": "image"}])
+
+    assert captured["model"] == "gemini-3.1-pro"
+
+
+def test_parse_completion_usage_supports_deepseek_cache_fields() -> None:
+    usage = _parse_completion_usage(
+        {
+            "prompt_tokens": 493,
+            "completion_tokens": 2,
+            "total_tokens": 495,
+            "prompt_cache_hit_tokens": 384,
+            "prompt_cache_miss_tokens": 109,
+            "prompt_tokens_details": {"cached_tokens": 384},
+        }
+    )
+
+    assert usage.prompt_tokens == 493
+    assert usage.cache_hit_tokens == 384
+    assert usage.cache_miss_tokens == 109
+
+
+def test_parse_completion_usage_falls_back_to_cached_tokens() -> None:
+    usage = _parse_completion_usage(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 60},
+        }
+    )
+
+    assert usage.total_tokens == 105
+    assert usage.cache_hit_tokens == 60
+    assert usage.cache_miss_tokens == 40
 
 
 def test_complete_raw_retries_without_temperature_when_provider_rejects(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -294,6 +481,51 @@ def test_complete_with_tools_sends_tools_and_parses_tool_calls(monkeypatch) -> N
     assert turn.message["tool_calls"][0]["id"] == "call_1"
 
 
+def test_complete_with_tools_preserves_reasoning_content_and_usage(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client = OpenAICompatibleClient(
+        ApiSettings("https://api.example.com/v1", "key", "deepseek-chat")
+    )
+
+    monkeypatch.setattr(
+        client,
+        "_post_chat_completions",
+        lambda _payload: {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "tool reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "echo_tool", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 3,
+                "prompt_cache_hit_tokens": 8,
+                "prompt_cache_miss_tokens": 12,
+            },
+        },
+    )
+
+    turn = client.complete_with_tools(
+        "system",
+        [{"role": "user", "content": "hello"}],
+        tools=[{"type": "function", "function": {"name": "echo_tool"}}],
+    )
+
+    assert turn.reasoning_content == "tool reasoning"
+    assert turn.message["reasoning_content"] == "tool reasoning"
+    assert turn.usage.cache_hit_tokens == 8
+
+
 def test_complete_with_tools_can_request_structured_json(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     captured: dict[str, Any] = {}
     client = OpenAICompatibleClient(
@@ -443,6 +675,29 @@ def test_list_models_wraps_url_error(monkeypatch) -> None:  # type: ignore[no-un
         assert "API 请求失败" in str(exc)
     else:
         raise AssertionError("URL 错误应包装为 ApiRequestError")
+
+
+def test_chat_retries_remote_disconnect_without_crashing(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client = OpenAICompatibleClient(
+        ApiSettings("https://api.example.com/v1", "key", "model", timeout_seconds=1)
+    )
+    attempts = {"count": 0}
+
+    def disconnect(_request, timeout):  # type: ignore[no-untyped-def]
+        attempts["count"] += 1
+        raise http.client.RemoteDisconnected("remote closed")
+
+    monkeypatch.setattr("urllib.request.urlopen", disconnect)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    try:
+        client.complete_raw("system", [{"role": "user", "content": "hello"}])
+    except ApiRequestError as exc:
+        assert "API 连接中断" in str(exc)
+    else:
+        raise AssertionError("连续断连后应返回普通 ApiRequestError")
+
+    assert attempts["count"] == 3
 
 
 def test_parse_chat_reply_keeps_segment_portrait() -> None:

@@ -11,13 +11,13 @@ from collections.abc import Callable
 from app.agent.actions import AgentProgress
 
 # 每轮对话最多允许的 Agent 决策步数
-MAX_AGENT_STEPS_PER_TURN = 4
+MAX_AGENT_STEPS_PER_TURN = 5
 
 # 每步最多允许的工具调用数
-MAX_TOOL_CALLS_PER_STEP = 3
+MAX_TOOL_CALLS_PER_STEP = 4
 
 # 整轮最多允许的工具调用总数
-MAX_TOOL_CALLS_PER_TURN = 8
+MAX_TOOL_CALLS_PER_TURN = 12
 
 # 工具结果截断字符数
 MAX_TOOL_RESULT_CHARS = 6000

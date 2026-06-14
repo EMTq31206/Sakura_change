@@ -1113,7 +1113,7 @@ def test_mcp_tool_call_exception_returns_failed_result() -> None:
     provider.close()
 
 
-def test_mcp_high_risk_still_requires_confirmation_with_free_access() -> None:
+def test_mcp_high_risk_executes_without_confirmation() -> None:
     root = _runtime_root_path("mcp_high_risk")
     registry = ToolRegistry()
     provider = MCPToolProvider(
@@ -1121,12 +1121,12 @@ def test_mcp_high_risk_still_requires_confirmation_with_free_access() -> None:
         bridge_factory=_FakeMCPBridge,
     )
     provider.register_tools(registry)
-    registry.set_free_access_enabled(True)
+    registry.set_free_access_enabled(False)
 
     result = registry.prepare_or_execute("dangerous_echo", {"message": "hello"})
 
-    assert isinstance(result, PendingToolAction)
-    assert result.tool_name == "dangerous_echo"
+    assert isinstance(result, ToolExecutionResult)
+    assert result.success
     provider.close()
 
 
@@ -1167,53 +1167,38 @@ def test_playwright_plugin_registers_native_browser_tools() -> None:
 
 
 def test_playwright_search_web_returns_structured_results(monkeypatch: pytest.MonkeyPatch) -> None:
-    class TitleEl:
-        def inner_text(self) -> str:
-            return "萌娘百科 - 二阶堂真红"
-
-    class SnippetEl:
-        def inner_text(self) -> str:
-            return "二阶堂真红是《五彩斑斓的世界》系列角色。"
-
-    class DisplayUrlEl:
-        def inner_text(self) -> str:
-            return "zh.moegirl.org.cn"
-
-    class LinkEl:
-        def get_attribute(self, name: str) -> str | None:
-            return "https://zh.moegirl.org.cn/二阶堂真红" if name == "href" else None
-
-    class ResultEl:
-        def query_selector(self, selector: str):  # type: ignore[no-untyped-def]
-            if selector == ".result__title":
-                return TitleEl()
-            if selector == ".result__snippet":
-                return SnippetEl()
-            if selector == ".result__url":
-                return DisplayUrlEl()
-            if selector == ".result__a":
-                return LinkEl()
-            return None
-
     class Page:
-        url = "https://html.duckduckgo.com/html/?q=%E4%BA%8C%E9%98%B6%E5%A0%82%E7%9C%9F%E7%BA%A2"
+        url = "https://www.bing.com/search?q=test"
+        visited_url = ""
 
-        def goto(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        def goto(self, url, **_kwargs):  # type: ignore[no-untyped-def]
+            self.visited_url = url
             return None
 
-        def query_selector_all(self, selector: str):  # type: ignore[no-untyped-def]
-            return [ResultEl()] if selector == ".result__body" else []
-
+    from app.agent.web_search import SearchResult
     from plugins.playwright_browser import browser
 
     monkeypatch.setattr(browser, "_page", None)
     monkeypatch.setattr(browser, "_bg_executor", None)
     monkeypatch.setattr(browser, "_browser_thread_id", None)
     monkeypatch.setattr(browser, "_use_bg_thread", True)
-    monkeypatch.setattr(browser, "_ensure_browser", lambda: Page())
+    page = Page()
+    monkeypatch.setattr(browser, "_ensure_browser", lambda: page)
+    monkeypatch.setattr(
+        browser,
+        "search_bing_rss",
+        lambda *_args, **_kwargs: [
+            SearchResult(
+                "萌娘百科 - 二阶堂真红",
+                "https://zh.moegirl.org.cn/二阶堂真红",
+                "二阶堂真红是《五彩斑斓的世界》系列角色。",
+            )
+        ],
+    )
 
     result = browser.search_web("二阶堂真红")
 
+    assert page.visited_url.startswith("https://www.bing.com/search?")
     assert "萌娘百科 - 二阶堂真红" in result
     assert "二阶堂真红是《五彩斑斓的世界》系列角色。" in result
     assert "zh.moegirl.org.cn" in result
@@ -1221,41 +1206,11 @@ def test_playwright_search_web_returns_structured_results(monkeypatch: pytest.Mo
 
 
 def test_playwright_search_web_registry_keeps_default_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    class TitleEl:
-        def inner_text(self) -> str:
-            return "萌娘百科 - 二阶堂真红"
-
-    class SnippetEl:
-        def inner_text(self) -> str:
-            return "二阶堂真红是《五彩斑斓的世界》系列角色。"
-
-    class DisplayUrlEl:
-        def inner_text(self) -> str:
-            return "zh.moegirl.org.cn"
-
-    class LinkEl:
-        def get_attribute(self, name: str) -> str | None:
-            return "https://zh.moegirl.org.cn/二阶堂真红" if name == "href" else None
-
-    class ResultEl:
-        def query_selector(self, selector: str):  # type: ignore[no-untyped-def]
-            if selector == ".result__title":
-                return TitleEl()
-            if selector == ".result__snippet":
-                return SnippetEl()
-            if selector == ".result__url":
-                return DisplayUrlEl()
-            if selector == ".result__a":
-                return LinkEl()
-            return None
-
     class Page:
         def goto(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return None
 
-        def query_selector_all(self, selector: str):  # type: ignore[no-untyped-def]
-            return [ResultEl()] if selector == ".result__body" else []
-
+    from app.agent.web_search import SearchResult
     from plugins.playwright_browser import browser
 
     monkeypatch.setattr(browser, "_page", None)
@@ -1263,6 +1218,17 @@ def test_playwright_search_web_registry_keeps_default_limit(monkeypatch: pytest.
     monkeypatch.setattr(browser, "_browser_thread_id", None)
     monkeypatch.setattr(browser, "_use_bg_thread", False)
     monkeypatch.setattr(browser, "_ensure_browser", lambda: Page())
+    monkeypatch.setattr(
+        browser,
+        "search_bing_rss",
+        lambda query, *, max_results: [
+            SearchResult(
+                "萌娘百科 - 二阶堂真红",
+                "https://zh.moegirl.org.cn/二阶堂真红",
+                f"{query}，limit={max_results}",
+            )
+        ],
+    )
 
     registry = ToolRegistry()
     manager = SakuraPluginManager(Path(__file__).resolve().parents[2])
@@ -1312,13 +1278,13 @@ def test_playwright_browser_operations_stay_on_single_worker_thread(monkeypatch:
     browser.shutdown_browser()
 
 
-def test_open_url_stays_confirmation_required() -> None:
+def test_open_url_executes_without_confirmation() -> None:
     registry = create_builtin_tool_registry(Path(__file__).resolve().parents[2])
     registry.set_free_access_enabled(False)
 
     result = registry.prepare_or_execute("open_url", {"url": "https://example.com"})
 
-    assert isinstance(result, PendingToolAction)
+    assert isinstance(result, ToolExecutionResult)
     assert result.tool_name == "open_url"
 
 
@@ -1459,8 +1425,9 @@ def test_agent_runtime_can_continue_tool_loop_after_tool_results() -> None:
     assert [action.payload["tool_name"] for action in result.actions] == ["first_tool", "second_tool"]
     assert len(client.prompts) == 3
     assert not client.final_chat_called
-    assert "这是第 1 步" in client.prompts[0]
-    assert "这是第 2 步" in client.prompts[1]
+    assert "运行时的时间、记忆摘要和循环状态" in client.prompts[0]
+    assert "当前为第 1 步" in str(client.messages[0])
+    assert "当前为第 2 步" in str(client.messages[1])
 
 
 def test_agent_runtime_stops_tool_loop_at_turn_limit() -> None:
@@ -1513,10 +1480,10 @@ def test_agent_runtime_stops_tool_loop_at_turn_limit() -> None:
             for action in result.actions
             if action.payload["tool_name"] == "echo_tool" and action.payload["success"]
         ]
-    ) == 8
-    assert any(action.payload["tool_name"] == "runtime" for action in result.actions)
-    assert client.raw_calls == 3
-    assert "已跳过" in str(client.chat_messages)
+    ) == 12
+    assert not any(action.payload["tool_name"] == "runtime" for action in result.actions)
+    assert client.raw_calls == 4
+    assert "tool_call_limit" not in str(client.chat_messages)
 
 
 def test_agent_runtime_emits_progress_before_pending_confirmation() -> None:
@@ -1645,8 +1612,8 @@ def test_visible_browser_request_hides_background_web_tools_from_planner() -> No
     assert "playwright_search_web" in client.tool_names
     assert "web__web_search" not in client.tool_names
     assert "web__fetch_url" not in client.tool_names
-    assert "playwright_search_web" in client.prompt
-    assert "不要先打开搜索首页再操作输入框" in client.prompt
+    assert "playwright_* 浏览器工具可用" in client.prompt
+    assert "绝不自己拼接搜索 URL" in client.prompt
 
 
 def test_browser_navigate_auto_snapshots_and_fast_forwards_lookup_reply() -> None:
@@ -1711,6 +1678,7 @@ def test_browser_navigate_auto_snapshots_and_fast_forwards_lookup_reply() -> Non
     assert client.raw_calls == 1
     assert client.chat_called
     assert "二阶堂真红是《五彩斑斓的世界》系列的女主角" in str(client.chat_messages)
+    assert any(message.get("role") == "tool" for message in client.chat_messages)
 
 
 def test_browser_navigate_does_not_duplicate_planned_snapshot() -> None:
@@ -2081,7 +2049,9 @@ def test_visible_browser_request_keeps_blocking_background_search_after_playwrig
                 )
             if self.raw_calls == 2:
                 assert "web__web_search" not in self.tool_names
-                assert "本轮是显式可见浏览器任务" in system_prompt
+                # 浏览器路由现在通过工具过滤实现，prompt 里保留可见浏览器模式指引。
+                assert "playwright_* 浏览器工具可用" in system_prompt
+                assert "可见浏览器模式" in system_prompt
                 return (
                     '{"reply":{"segments":[{"ja":"別の方法で探すね。","zh":"我换个方式找。","tone":"中性"}]},'
                     '"tool_calls":[{"name":"web__web_search","arguments":{"query":"二阶堂真红 百科"},"reason":"后台搜索"}]}'
@@ -2439,7 +2409,9 @@ def test_autonomous_screen_observation_can_request_screen_without_explicit_user_
     assert "不要重复截图" in client.prompts[0]
     assert [progress.reply.translation for progress in progress_replies] == ["我看看。"]
     assert result.actions
-    assert result.actions[0].type == SCREEN_OBSERVATION_REQUEST_ACTION
+    assert not any(
+        action.type == SCREEN_OBSERVATION_REQUEST_ACTION for action in result.actions
+    )
 
 
 def test_tool_planning_prompt_encourages_web_search_for_uncertain_external_info() -> None:
@@ -2474,8 +2446,9 @@ def test_tool_planning_prompt_encourages_web_search_for_uncertain_external_info(
 
     assert "web__web_search" in client.tool_names
     assert "最新、外部、公开或不确定的信息" in client.prompts[0]
-    assert "主动使用可用的网页搜索工具" in client.prompts[0]
-    assert "搜索摘要不足以回答时，再读取具体网页" in client.prompts[0]
+    assert "主动使用网页搜索工具" in client.prompts[0]
+    assert "搜索摘要不足以回答时再读取" in client.prompts[0]
+    assert "具体网页正文" in client.prompts[0]
 
 
 def test_autonomous_screen_observation_disabled_hides_screen_tool() -> None:
@@ -2500,7 +2473,10 @@ def test_autonomous_screen_observation_disabled_hides_screen_tool() -> None:
 
     runtime.handle_user_message([{"role": "user", "content": "你觉得我现在是不是卡住了？"}])
 
-    assert "当前没有可用的自主屏幕观察工具" in client.prompts[0]
+    # 自主屏幕观察关闭后，observe_screen 工具不应出现在工具列表里。
+    assert "observe_screen" not in client.tool_names
+    # prompt 里保留屏幕观察能力不可用时的指引。
+    assert "如果没有屏幕观察工具" in client.prompts[0]
 
 
 def test_screen_observation_tool_hidden_without_user_message() -> None:
@@ -2696,6 +2672,7 @@ def test_screen_observation_trigger_requires_explicit_text() -> None:
     assert should_observe_screen("帮我看这个界面哪里不对")
     assert should_observe_screen("看看当前画面")
     assert not should_observe_screen("今天聊点什么")
+    assert not should_observe_screen("学姐？")
 
 
 def test_vision_unsupported_error_gets_local_fallback_reply() -> None:
@@ -2740,15 +2717,15 @@ def test_proactive_check_tool_prompt_uses_single_segment_heading() -> None:
 
     assert prompt.count("分段规则：") == 1
     assert "主动屏幕检查事件" in prompt
-    assert "这是第 1 步" in prompt
+    assert "运行时的时间、记忆摘要和循环步数由最后一条上下文消息提供" in prompt
     assert "每步最多请求 3 个工具，整轮最多 8 个工具" in prompt
-    assert "主人正在整理提示词。" in prompt
-    assert "2026-06-01T08:00:00+08:00" in prompt
+    assert "主人正在整理提示词。" not in prompt
+    assert "2026-06-01T08:00:00+08:00" not in prompt
     assert "额外规则。" in prompt
     assert "JSON 格式如下" in prompt
     assert "主动感知回复决策流程" in prompt
     assert "主动感知场景策略" in prompt
-    assert "最终回复必须至少包含一个来自 screen_contexts 或 visual_contexts 的具体可见信息" in prompt
+    assert "最终回复必须至少点到一个具体可见对象" in prompt
     assert "图片/角色/女性照片" in prompt
     assert "不确定时就普通问候" not in prompt
 
@@ -2763,11 +2740,11 @@ def test_proactive_check_event_prompt_reuses_segment_rules() -> None:
 
     assert prompt.count("分段规则：") == 1
     assert "低打扰主动搭话" in prompt
-    assert "屏幕画面和近期对话充分时，可以展开到 2-4 段" in prompt
-    assert "主动搭话时不要固定使用同一种语气" in prompt
+    assert "屏幕画面和近期对话充分时，可以充分展开" in prompt
+    assert "tone 和 portrait 根据内容自然选择" in prompt
     assert "先阅读 recent_conversation" in prompt
     assert "把 screen_contexts/visual_contexts 和 recent_conversation 交叉对照" in prompt
-    assert "只有画面确实为空、黑屏、桌面无内容" in prompt
+    assert "画面确实为空、黑屏、桌面无内容" in prompt
 
 
 def test_proactive_check_event_generates_segmented_reply() -> None:
@@ -2805,10 +2782,10 @@ def test_proactive_check_event_generates_segmented_reply() -> None:
 
     assert "低打扰主动搭话" in client.prompts[0]
     assert "只表示用户一段时间没有和桌宠交互" in client.prompts[0]
-    assert "不要据此推断用户离开" in client.prompts[0]
+    assert "不要据此过度推断" in client.prompts[0]
     assert "真实可见或已知的具体内容" in client.prompts[0]
     assert "自然搭话、提问或提醒用户" in client.prompts[0]
-    assert "tone 和 portrait 要根据内容选择" in client.prompts[0]
+    assert "tone 和 portrait 根据内容自然选择" in client.prompts[0]
     assert "自然搭话" in str(client.messages[0][0]["content"])
     assert "seconds_since_pet_interaction" in str(client.messages[0][0]["content"])
     assert "idle_seconds" not in str(client.messages[0][0]["content"])
@@ -2862,7 +2839,7 @@ def test_proactive_check_event_attaches_screen_context_image() -> None:
     assert "自然评论、提问或轻提醒" in client.prompts[0]
     assert "不要编造看不清" in client.prompts[0]
     assert "不要再请求 observe_screen" in client.prompts[0]
-    assert "主动搭话时不要固定使用同一种语气" in client.prompts[0]
+    assert "tone 和 portrait 根据内容自然选择" in client.prompts[0]
     assert "自然搭话" in content[0]["text"]
 
 
@@ -3113,15 +3090,26 @@ def test_proactive_check_hides_screen_tool_when_screen_context_disallowed() -> N
     assert not any(action.type == SCREEN_OBSERVATION_REQUEST_ACTION for action in result.actions)
 
 
-def test_proactive_check_vision_unsupported_uses_safe_fallback() -> None:
+def test_proactive_check_vision_unsupported_retries_without_image() -> None:
     class ProactiveVisionUnsupportedClient:
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, object]]] = []
+
         def complete_raw(self, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
-            raise ApiRequestError("model does not support image_url content")
+            messages = _args[1]
+            self.calls.append(messages)
+            if messages_contain_image(messages):
+                raise ApiRequestError("model does not support image_url content")
+            return (
+                '{"reply":{"segments":[{"ja":"先輩？まだ起きてる？",'
+                '"zh":"学姐？还醒着吗？","tone":"中性"}]},"tool_calls":[]}'
+            )
 
         complete_with_tools = _legacy_complete_with_tools
 
+    client = ProactiveVisionUnsupportedClient()
     runtime = AgentRuntime(
-        api_client=ProactiveVisionUnsupportedClient(),  # type: ignore[arg-type]
+        api_client=client,  # type: ignore[arg-type]
         system_prompt="你是 Sakura。",
     )
 
@@ -3138,8 +3126,13 @@ def test_proactive_check_vision_unsupported_uses_safe_fallback() -> None:
         )
     )
 
-    assert "不会乱猜" in result.reply.translation
+    assert result.reply.translation == "学姐？还醒着吗？"
     assert result.actions[0].payload["event_type"] == "proactive_check"
+    assert len(client.calls) == 2
+    assert messages_contain_image(client.calls[0])
+    assert not messages_contain_image(client.calls[1])
+    assert "不要向用户报告视觉能力错误" in str(client.calls[1])
+    assert runtime.model_vision_enabled
 
 
 def test_plain_text_messages_do_not_contain_image() -> None:

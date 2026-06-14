@@ -21,6 +21,18 @@ class ApiSettings:
     api_key: str = ""
     model: str = "gpt-4.1-mini"
     timeout_seconds: int = 60
+    vision_model: str = ""
+
+
+@dataclass(frozen=True)
+class VisionApiSettings:
+    """独立图片理解 API 配置。"""
+
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: int = 60
 
 
 # ---- 调试日志 ----

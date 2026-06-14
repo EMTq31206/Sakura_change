@@ -14,18 +14,23 @@ if errorlevel 1 (
 )
 
 REM ============================================================
-REM 检测 Python：优先使用 runtime/python.exe，其次系统 Python
+REM 激活 Anaconda sakura 环境
 REM ============================================================
-if exist "%PRJ_ROOT%\runtime\python.exe" (
-    set "PYTHON_EXE=%PRJ_ROOT%\runtime\python.exe"
-) else (
-    where python > nul 2>&1
-    if errorlevel 1 (
-        echo [错误] 未检测到 Python，请先运行 install.bat 安装依赖
-        pause
-        exit /b 1
-    )
-    set "PYTHON_EXE=python"
+call "C:\ProgramData\anaconda3\Scripts\activate.bat" sakura
+if errorlevel 1 (
+    echo [错误] 无法激活 conda 环境 sakura
+    pause
+    exit /b 1
+)
+
+REM ============================================================
+REM 检测 Python
+REM ============================================================
+set "PYTHON_EXE=C:\ProgramData\anaconda3\envs\sakura\python.exe"
+if not exist "%PYTHON_EXE%" (
+    echo [错误] 未找到 Python: %PYTHON_EXE%
+    pause
+    exit /b 1
 )
 
 REM ============================================================

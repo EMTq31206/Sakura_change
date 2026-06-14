@@ -4,6 +4,7 @@ from app.llm.prompts.blocks import (
     AGENT_REPLY_FORMAT,
     DEFAULT_REPLY_PORTRAITS,
     DEFAULT_REPLY_TONES,
+    NARRATION_SEGMENT_RULES,
     SEGMENTED_REPLY_FORMAT,
     build_proactive_check_segment_rules,
     build_segment_protocol,
@@ -31,10 +32,12 @@ def build_segmented_reply_instruction(
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     portraits = labels_or_default(reply_portraits, DEFAULT_REPLY_PORTRAITS)
     rules = [
-        f"- 尽量输出 {default_segments} 段文本，每段是一条可以单独显示和朗读的完整小消息，不要把一句话机械切碎。",
-        "- 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。",
+        f"- 尽量输出 {default_segments} 段文本，但可以根据内容自由增减，不设上限。",
+        "- 内容需要完整自然，叙述描写不设长度限制，鼓励充分展开。",
         f"- 如果用户只问很简单的问题，可以只输出 {simple_segments} 段。",
         "- 需要对每段文本的语气进行标注，语气标签放在 tone 字段中。优先选择中性，除非文本明显带有其他语气；如果文本中同时包含多种语气，请选择最突出的一种。",
+        "",
+        NARRATION_SEGMENT_RULES,
     ]
     if include_no_single_segment_rule:
         rules.extend(
@@ -60,11 +63,12 @@ def build_agent_reply_protocol(
     portraits = labels_or_default(reply_portraits, DEFAULT_REPLY_PORTRAITS)
     segment_rules = "\n".join(
         [
-            "- 尽量输出 2-4 段文本，每段是一条可以单独显示和朗读的完整小消息，不要把一句话机械切碎。",
-            "- 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。",
-            "- 如果用户只问很简单的问题，可以只输出 1-2 段。",
-            "- 用户问题包含多个要点、步骤、原因或较长说明时，优先输出 3-4 段，让桌宠可以逐段显示和朗读。",
+            "- 可以根据话题自由输出任意数量的自然段落，不设段数和字数上限。",
+            "- 内容少就简洁，话题丰富时可以充分展开为长段落、多轮叙述或完整对话，不需要刻意压缩。",
+            "- 每句话完整自然即可，不要为分段而机械切碎。",
             "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
+            "",
+            NARRATION_SEGMENT_RULES,
         ]
     )
     return build_segment_protocol(
@@ -141,7 +145,7 @@ def build_proactive_check_tool_system_prompt(
                 "\n\n".join(
                     [
                         "你现在正在处理【主动检查事件 / 主动屏幕检查事件】。这不是用户直接发来的请求，而是系统定时触发的低打扰搭话。",
-                        "请用角色语气自然搭话、提问或提醒用户。",
+                        "请生成低打扰主动搭话，用角色语气自然搭话、提问或提醒用户。",
                         "请把 screen_contexts/visual_contexts 当作当前画面，把 recent_conversation 当作最近完整对话历史；必须结合两者判断用户正在延续什么任务、发生了什么变化、哪些话题已经聊过，再自然接话。",
                     ]
                 ),
@@ -155,6 +159,7 @@ def build_proactive_check_tool_system_prompt(
                         "- 优先使用 visual_contexts 中的 summary、visible_texts、notable_elements。",
                         "- 最终回复必须至少点到一个具体可见对象，除非视觉上下文为空或明确不可识别。",
                         "- 如果只能部分识别，也要先说出能确认的部分，再轻轻询问。",
+                        "- 不要编造看不清的画面细节。",
                         "- 不要机械套用休息、喝水、深呼吸、累不累等通用关怀。",
                     ]
                 ),
@@ -166,18 +171,19 @@ def build_proactive_check_tool_system_prompt(
             proactive_reply_examples_block(),
             PromptBlock(None, reply_protocol),
             PromptBlock(None, extra_instructions.strip()),
-            PromptBlock(None, f"长期记忆摘要：\n{memory_summary}"),
-            PromptBlock(None, f"当前本地时间：\n{current_time}"),
             PromptBlock(
                 None,
                 "\n".join(
                     [
+                        "运行时的时间、记忆摘要和循环步数由最后一条上下文消息提供。",
                         "当前 Agent 循环：",
-                        f"- 这是第 {step_index + 1} 步，之后最多还可以继续 {remaining_steps} 步。",
-                        "- 如果信息足够或已经完成，不要再发起 tool_calls。",
+                        "- 外部、不确定或时效性信息应积极调用工具核实；搜索摘要不足时继续读取最相关正文。",
+                        "- 所有 MCP 工具均已获得用户预先授权，不需要询问或等待许可。",
+                        "- 可以并行调用目的互补的工具；同一工具同参数失败后不要重复。",
+                        "- 如果信息足够或已经完成，立即停止 tool_calls 并自然回复。",
                         f"- 每步最多请求 {max_tool_calls_per_step} 个工具，整轮最多 {max_tool_calls_per_turn} 个工具。",
                         "",
-                        "- 你可以使用只读或低风险工具补充上下文（后台 Web 搜索、当前时间、搜索记忆、列出待办和笔记、查看已有提醒）。",
+                        "- 主动使用适合当前上下文的工具补充信息，尤其是后台 Web 搜索、网页正文读取、当前时间、搜索记忆、列出待办和笔记、查看已有提醒。",
                         "- 如果事件已有 screen_contexts（多张截图），不要再请求 observe_screen。",
                         "- 不要循环调用工具；工具结果足够后直接给最终回复。",
                         "- 最终回复只说给用户听的自然搭话、提问或轻提醒，不要提及内部事件或工具协议。",
@@ -204,6 +210,7 @@ def build_event_system_prompt(
     if event_type == "proactive_check":
         blocks.extend(
             [
+                PromptBlock(None, "这是一次低打扰主动搭话。"),
                 PromptBlock(
                     None,
                     build_proactive_check_reply_protocol(reply_tones, reply_portraits),

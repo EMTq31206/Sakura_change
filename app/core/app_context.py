@@ -7,7 +7,7 @@ from app.agent import AgentRuntime, MemoryStore, ReminderStore, ToolRegistry
 from app.agent.mcp import MCPRuntimeSettings, MCPToolProvider
 from app.agent.memory_curator import MemoryCurator, MemoryCurationSettings, MemoryCurationState
 from app.config.settings_service import AppSettingsService, DebugLogSettings
-from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient, VisionApiSettings
 from app.config.character_loader import CharacterProfile, CharacterRegistry
 from app.storage.chat_history import ChatHistoryStore
 from app.core.extensions import ExtensionRegistry
@@ -22,6 +22,7 @@ class CoreServices:
     """聊天运行时和工具注册等核心服务。"""
 
     api_client: OpenAICompatibleClient
+    vision_client: OpenAICompatibleClient | None
     tool_registry: ToolRegistry
     agent_runtime: AgentRuntime
 
@@ -59,6 +60,7 @@ class AppContext:
     base_dir: Path
     settings_service: AppSettingsService
     settings: ApiSettings
+    vision_settings: VisionApiSettings
     character_registry: CharacterRegistry
     character_profile: CharacterProfile
     system_prompt: str
@@ -71,6 +73,10 @@ class AppContext:
     @property
     def api_client(self) -> OpenAICompatibleClient:
         return self.core.api_client
+
+    @property
+    def vision_client(self) -> OpenAICompatibleClient | None:
+        return self.core.vision_client
 
     @property
     def tool_registry(self) -> ToolRegistry:

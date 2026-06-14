@@ -262,6 +262,7 @@ def _character_packages_missing(base_dir: Path) -> bool:
 def _open_first_run_settings(base_dir: Path) -> AppContext | None:
     settings_service = AppSettingsService(base_dir=base_dir)
     api_settings = settings_service.load_api_settings()
+    vision_settings = settings_service.load_vision_api_settings()
     tts_settings = settings_service.load_tts_settings(
         validate_enabled=False,
         character_profile=None,
@@ -279,6 +280,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         subtitle_typing_interval_ms=SPEECH_TYPING_INTERVAL_MS,
         reply_segment_pause_ms=REPLY_SEGMENT_PAUSE_MS,
         theme_settings=settings_service.load_theme_settings(),
+        vision_settings=vision_settings,
     )
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
@@ -294,8 +296,14 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         "result_theme_settings",
         settings_service.load_theme_settings(),
     )
+    result_vision_settings = getattr(
+        dialog,
+        "result_vision_settings",
+        vision_settings,
+    )
     if (
         dialog.result_api_settings is None
+        or result_vision_settings is None
         or dialog.result_tts_settings is None
         or dialog.result_character_id is None
         or dialog.result_proactive_care_settings is None
@@ -309,6 +317,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         return None
 
     settings_service.save_api_settings(dialog.result_api_settings)
+    settings_service.save_vision_api_settings(result_vision_settings)
     settings_service.save_tts_settings(dialog.result_tts_settings)
     settings_service.save_current_character_id(
         dialog.character_registry,
@@ -352,8 +361,7 @@ def _start_tts_migration_or_deferred(base_dir: Path, pet_window: PetWindow) -> N
     worker.finished.connect(thread.quit)
     thread.finished.connect(worker.deleteLater)
     thread.finished.connect(thread.deleteLater)
-    thread.finished.connect(lambda: setattr(pet_window, "tts_migration_thread", None))
-    thread.finished.connect(lambda: setattr(pet_window, "tts_migration_worker", None))
+    thread.finished.connect(pet_window.finalize_tts_migration_thread)
 
     dialog.show()
     thread.start()
@@ -420,13 +428,11 @@ def _start_deferred_startup(base_dir: Path, pet_window: PetWindow) -> None:
     pet_window.deferred_startup_worker = worker
     thread.started.connect(worker.run)
     worker.finished.connect(pet_window.apply_deferred_services)
-    worker.failed.connect(pet_window.handle_deferred_startup_failed)
+    worker.failed.connect(pet_window.capture_deferred_startup_error)
     worker.finished.connect(thread.quit)
-    worker.failed.connect(thread.quit)
     thread.finished.connect(worker.deleteLater)
     thread.finished.connect(thread.deleteLater)
-    thread.finished.connect(lambda: setattr(pet_window, "deferred_startup_thread", None))
-    thread.finished.connect(lambda: setattr(pet_window, "deferred_startup_worker", None))
+    thread.finished.connect(pet_window.finalize_deferred_startup_thread)
     thread.start()
 
 if __name__ == "__main__":

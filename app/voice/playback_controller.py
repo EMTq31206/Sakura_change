@@ -76,7 +76,7 @@ class VoicePlaybackController:
                 "TTS",
                 "播放控制器捕获 TTS 异常，回退为仅显示字幕",
                 {
-                    "text": segment.text,
+                    "text_chars": len(segment.text),
                     "tone": segment.tone,
                     "error": str(exc),
                 },
@@ -111,7 +111,7 @@ class VoicePlaybackController:
             "PetWindow",
             "预生成下一段 TTS",
             {
-                "text": next_segment.text,
+                "text_chars": len(next_segment.text),
                 "tone": next_segment.tone,
                 "portrait": next_segment.portrait,
             },
@@ -162,6 +162,8 @@ class VoicePlaybackController:
             return "ja"
 
     def _should_skip_segment_tts(self, segment: ChatSegment) -> bool:
+        if not segment.text.strip():
+            return True
         return should_skip_tts_text(segment.text, self._target_text_lang())
 
     def _log_tts_skipped(

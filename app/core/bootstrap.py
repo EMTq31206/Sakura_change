@@ -8,7 +8,7 @@ from app.agent.mcp import MCPToolProvider, register_mcp_tools_from_config
 from app.agent.mcp.settings import MCPRuntimeSettings
 from app.agent.memory_curator import MemoryCurator, MemoryCurationState
 from app.config.settings_service import AppSettingsService
-from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient, VisionApiSettings
 from app.core.app_context import AppContext, CoreServices, FeatureServices, StorageServices
 from app.core.extensions import ExtensionRegistry
 from app.config.character_loader import (
@@ -43,6 +43,7 @@ class StartupState:
     base_dir: Path
     settings_service: AppSettingsService
     settings: ApiSettings
+    vision_settings: VisionApiSettings
     character_registry: CharacterRegistry
     character_profile: CharacterProfile
     system_prompt: str
@@ -67,6 +68,7 @@ def load_startup_state(base_dir: Path) -> StartupState:
 
     settings_service = AppSettingsService(base_dir=base_dir)
     settings = settings_service.load_api_settings()
+    vision_settings = settings_service.load_vision_api_settings()
     debug_log(
         "Startup",
         "API 配置已加载",
@@ -103,6 +105,7 @@ def load_startup_state(base_dir: Path) -> StartupState:
         base_dir=base_dir,
         settings_service=settings_service,
         settings=settings,
+        vision_settings=vision_settings,
         character_registry=character_registry,
         character_profile=character_profile,
         system_prompt=system_prompt,
@@ -116,10 +119,16 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     startup_state = startup_state or load_startup_state(base_dir)
     settings_service = startup_state.settings_service
     settings = startup_state.settings
+    vision_settings = startup_state.vision_settings
     character_registry = startup_state.character_registry
     character_profile = startup_state.character_profile
     system_prompt = startup_state.system_prompt
     api_client = OpenAICompatibleClient(settings)
+    vision_client = (
+        OpenAICompatibleClient(vision_settings.to_api_settings(), channel="vision")
+        if vision_settings.is_configured()
+        else None
+    )
     memory_store = MemoryStore(
         base_dir=base_dir,
         api_settings=settings,
@@ -143,7 +152,9 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         reply_portraits=character_profile.portrait_choices,
         tools=tool_registry,
         memory=memory_store,
+        vision_client=vision_client,
     )
+    agent_runtime.character_dir = character_profile.card_path.parent
     history_store = _create_history_store(base_dir, character_profile)
     visual_observation_store = _create_visual_observation_store(base_dir, character_profile)
     debug_log_settings = settings_service.load_debug_log_settings()
@@ -170,12 +181,14 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         base_dir=base_dir,
         settings_service=settings_service,
         settings=settings,
+        vision_settings=vision_settings,
         character_registry=character_registry,
         character_profile=character_profile,
         system_prompt=system_prompt,
         tts_provider=NullTTSProvider(),
         core=CoreServices(
             api_client=api_client,
+            vision_client=vision_client,
             tool_registry=tool_registry,
             agent_runtime=agent_runtime,
         ),
@@ -287,12 +300,14 @@ def build_app_context(base_dir: Path, startup_state: StartupState | None = None)
         base_dir=context.base_dir,
         settings_service=context.settings_service,
         settings=context.settings,
+        vision_settings=context.vision_settings,
         character_registry=context.character_registry,
         character_profile=context.character_profile,
         system_prompt=context.system_prompt,
         tts_provider=deferred.tts_provider,
         core=CoreServices(
             api_client=context.api_client,
+            vision_client=context.vision_client,
             tool_registry=deferred.tool_registry,
             agent_runtime=context.agent_runtime,
         ),

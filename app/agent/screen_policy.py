@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from app.agent.screen_observation import (
     MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER,
+    SCREEN_OBSERVATION_FAILURE_MARKER,
     SCREEN_OBSERVATION_HISTORY_MARKER,
+    should_observe_screen,
 )
 
 
@@ -16,6 +18,8 @@ class ScreenPolicy:
         if text is None:
             return False
         return (
-            SCREEN_OBSERVATION_HISTORY_MARKER not in text
+            should_observe_screen(text)
+            and SCREEN_OBSERVATION_HISTORY_MARKER not in text
             and MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER not in text
+            and SCREEN_OBSERVATION_FAILURE_MARKER not in text
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from app.agent.screen_observation import ScreenObservation
@@ -10,6 +11,7 @@ from app.storage.visual_observation import (
     VisualObservationRecord,
     VisualObservationStore,
     build_visual_context_message,
+    replace_images_with_visual_context,
     summarize_visual_observation,
 )
 
@@ -52,6 +54,44 @@ def test_summarize_visual_observation_saves_structured_text_without_image_data()
     assert "base64" not in json.dumps(record.__dict__, ensure_ascii=False)
 
 
+def test_replace_images_with_visual_context_removes_base64() -> None:
+    record = VisualObservationRecord(
+        id="vis_text",
+        created_at="2026-06-11T12:00:00+08:00",
+        source="manual_screenshot",
+        user_text="看这里",
+        screen_name="primary",
+        width=320,
+        height=180,
+        summary="编辑器中显示缓存统计。",
+        visible_texts=["prompt_cache_hit_tokens"],
+        uncertain_texts=[],
+        notable_elements=["代码编辑器"],
+        confidence=0.95,
+    )
+
+    messages = replace_images_with_visual_context(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "帮我看"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64,secret"},
+                    },
+                ],
+            }
+        ],
+        [record],
+    )
+
+    encoded = json.dumps(messages, ensure_ascii=False)
+    assert "data:image" not in encoded
+    assert "prompt_cache_hit_tokens" in encoded
+    assert messages[-1]["content"] == "帮我看"
+
+
 def test_visual_observation_store_redacts_sensitive_text_and_omits_images() -> None:
     path = Path("data") / f"test_visual_{uuid.uuid4().hex}.jsonl"
     try:
@@ -59,7 +99,7 @@ def test_visual_observation_store_redacts_sensitive_text_and_omits_images() -> N
         store.append(
             VisualObservationRecord(
                 id="vis_secret",
-                created_at="2026-05-31T12:00:00+08:00",
+                created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
                 source="manual_screenshot",
                 user_text="密码: 123456",
                 screen_name="DISPLAY1",

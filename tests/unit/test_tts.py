@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 import types
 import urllib.error
 import uuid
+import wave
 from dataclasses import replace
 from pathlib import Path
 
@@ -77,9 +79,12 @@ from app.voice.tts import (
     GPTSoVITSTTSSettings,
     TTSPreparedAudio,
     _build_gpt_sovits_start_command,
+    _build_runtime_tts_config,
     _build_genie_endpoint_url,
     _load_tone_references,
+    _is_valid_wav,
     _resolve_request_text_lang,
+    sanitize_tts_text,
     _write_genie_audio,
 )
 from app.voice import VoicePlaybackController
@@ -114,6 +119,33 @@ def test_tts_plain_japanese_keeps_configured_lang() -> None:
     text = "でも私、初めて君に会った時、思ったよ。"
 
     assert _resolve_request_text_lang(text, "ja") == "ja"
+
+
+def test_tts_sanitizes_paths_commands_and_non_japanese_quotes() -> None:
+    text = "パスは /Users/demo/project/file.py。`cp -r a b`。「请详细说出屏幕内容！」"
+
+    cleaned = sanitize_tts_text(text)
+
+    assert "/Users/" not in cleaned
+    assert "cp -r" not in cleaned
+    assert "请详细" not in cleaned
+    assert "ファイルパス" in cleaned
+    assert "コマンド" in cleaned
+
+
+def test_runtime_tts_config_enables_mps_half_without_touching_source() -> None:
+    root = _runtime_root("runtime_precision")
+    source = root / "tts.yaml"
+    source.write_text("custom:\n  device: mps\n  is_half: false\n", encoding="utf-8")
+    settings = _minimal_tts_settings(
+        work_dir=root,
+        tts_config_path=source,
+    )
+
+    generated = _build_runtime_tts_config(settings, "fp16")
+
+    assert "is_half: true" in generated.read_text(encoding="utf-8")
+    assert "is_half: false" in source.read_text(encoding="utf-8")
 
 
 def test_tts_explicit_english_lang_is_not_overridden() -> None:
@@ -488,6 +520,52 @@ def test_gptsovits_ensure_ready_returns_success_after_service_and_weights(monkey
     assert ok
     assert "已就绪" in message
     assert calls == ["service", "weights"]
+
+
+def test_gptsovits_ensure_ready_falls_back_once_when_fp16_probe_is_silent(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = GPTSoVITSTTSProvider(
+        replace(_minimal_tts_settings(), precision_mode="auto")
+    )
+    provider._active_precision = "fp16"
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        GPTSoVITSTTSProvider,
+        "_ensure_service_available",
+        lambda *_args: calls.append("service") or True,
+    )
+    monkeypatch.setattr(
+        GPTSoVITSTTSProvider,
+        "_ensure_character_weights",
+        lambda *_args: calls.append("weights") or True,
+    )
+    monkeypatch.setattr(
+        GPTSoVITSTTSProvider,
+        "_probe_precision_audio",
+        lambda *_args: calls.append("probe") or False,
+    )
+
+    def fake_fallback(self):  # type: ignore[no-untyped-def]
+        calls.append("fallback")
+        self._active_precision = "fp32"
+        return True
+
+    monkeypatch.setattr(GPTSoVITSTTSProvider, "_try_fp32_fallback", fake_fallback)
+
+    ok, message = GPTSoVITSTTSProvider.ensure_ready(provider)
+
+    assert ok
+    assert "FP32" in message
+    assert calls == ["service", "weights", "probe", "fallback", "weights"]
+    assert provider._precision_probe_completed
+
+
+def test_wav_validation_rejects_silent_placeholder() -> None:
+    silent = _wav_bytes([0] * 3200)
+    audible = _wav_bytes([0, 12, -24, 48] * 800)
+
+    assert not _is_valid_wav(silent)
+    assert _is_valid_wav(audible)
 
 
 def test_gptsovits_ensure_ready_returns_service_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1092,3 +1170,13 @@ def _runtime_root(name: str) -> Path:
 def _write_fake_runtime_python(path: Path, content: str = "fake") -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _wav_bytes(samples: list[int]) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(32000)
+        wav_file.writeframes(b"".join(sample.to_bytes(2, "little", signed=True) for sample in samples))
+    return output.getvalue()

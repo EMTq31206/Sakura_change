@@ -7,7 +7,7 @@ from typing import Any
 from app.agent.mcp.settings import MCPRuntimeSettings, normalize_mcp_runtime_settings
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
-from app.llm.api_client import ApiSettings
+from app.llm.api_client import ApiSettings, VisionApiSettings
 from app.ui.theme import ThemeSettings, theme_from_mapping, theme_to_mapping
 from app.agent.proactive_care import (
     PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES,
@@ -22,6 +22,7 @@ from app.voice.tts import (
     TTS_PROVIDER_GENIE,
     TTS_PROVIDER_GPT_SOVITS,
     TTS_PROVIDER_NONE,
+    TTS_PRECISION_AUTO,
     GPTSoVITSTTSSettings,
 )
 
@@ -73,6 +74,7 @@ class AppSettingsService:
             api_key=str(data.get("api_key", "")).strip(),
             model=str(data.get("model", "gpt-4.1-mini")).strip(),
             timeout_seconds=timeout_seconds,
+            vision_model=str(data.get("vision_model", "")).strip(),
         )
 
     def save_api_settings(self, settings: ApiSettings) -> None:
@@ -83,6 +85,41 @@ class AppSettingsService:
             "model": settings.model.strip(),
             "timeout_seconds": int(settings.timeout_seconds),
         }
+        save_yaml_mapping(self.api_config_path, data)
+
+    def load_vision_api_settings(self) -> VisionApiSettings:
+        data = self._api_section("vision")
+        if data:
+            return VisionApiSettings(
+                enabled=_bool_value(data.get("enabled"), False),
+                base_url=str(data.get("base_url", "")).strip().rstrip("/"),
+                api_key=str(data.get("api_key", "")).strip(),
+                model=str(data.get("model", "")).strip(),
+                timeout_seconds=_int_value(data.get("timeout_seconds"), 60),
+            )
+
+        legacy = self.load_api_settings()
+        legacy_model = legacy.vision_model.strip()
+        return VisionApiSettings(
+            enabled=bool(legacy_model),
+            base_url=legacy.base_url if legacy_model else "",
+            api_key=legacy.api_key if legacy_model else "",
+            model=legacy_model,
+            timeout_seconds=legacy.timeout_seconds,
+        )
+
+    def save_vision_api_settings(self, settings: VisionApiSettings) -> None:
+        data = load_yaml_mapping(self.api_config_path)
+        data["vision"] = {
+            "enabled": bool(settings.enabled),
+            "base_url": settings.base_url.strip().rstrip("/"),
+            "api_key": settings.api_key.strip(),
+            "model": settings.model.strip(),
+            "timeout_seconds": int(settings.timeout_seconds),
+        }
+        llm = data.get("llm")
+        if isinstance(llm, dict):
+            llm.pop("vision_model", None)
         save_yaml_mapping(self.api_config_path, data)
 
     def load_tts_settings(
@@ -133,6 +170,9 @@ class AppSettingsService:
         ref_lang = str(provider_data.get("ref_lang", gpt_sovits.get("ref_lang", "zh"))).strip()
         text_lang = str(provider_data.get("text_lang", gpt_sovits.get("text_lang", "zh"))).strip()
         timeout_seconds = _int_value(provider_data.get("timeout_seconds"), 60)
+        precision_mode = str(
+            gpt_sovits.get("precision_mode", TTS_PRECISION_AUTO)
+        ).strip().lower() or TTS_PRECISION_AUTO
         onnx_model_dir = _optional_path(genie_tts.get("onnx_model_dir"), self.base_dir)
         if character_profile is not None:
             if provider == TTS_PROVIDER_GENIE and onnx_model_dir is None:
@@ -156,6 +196,7 @@ class AppSettingsService:
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=timeout_seconds,
+                precision_mode=precision_mode,
                 provider=provider,
                 work_dir=work_dir,
                 python_path=python_path,
@@ -181,6 +222,7 @@ class AppSettingsService:
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=timeout_seconds,
+                precision_mode=precision_mode,
             )
         if settings.enabled and validate_enabled:
             settings.validate()
@@ -216,6 +258,7 @@ class AppSettingsService:
                 "ref_lang": settings.ref_lang.strip(),
                 "text_lang": settings.text_lang.strip(),
                 "timeout_seconds": int(settings.timeout_seconds),
+                "precision_mode": settings.precision_mode,
             }
         data["tts"] = tts_data
         save_yaml_mapping(self.api_config_path, data)

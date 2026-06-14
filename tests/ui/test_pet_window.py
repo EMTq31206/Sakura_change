@@ -14,7 +14,7 @@ import pytest
 
 from app.agent.mcp import MCPRuntimeSettings
 from app.config.settings_service import DebugLogSettings
-from app.llm.api_client import ApiSettings
+from app.llm.api_client import ApiSettings, VisionApiSettings
 from app.llm.chat_reply import ChatSegment
 from app.ui.portrait_utils import portrait_kind_key, should_crossfade_portrait
 from app.ui.theme import (
@@ -3629,6 +3629,80 @@ def test_queued_history_clear_starts_after_auto_curation_cleanup(monkeypatch) ->
     assert timer_calls == []
 
 
+def test_worker_error_is_handled_after_thread_references_are_cleared() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class DisposableStub:
+        def deleteLater(self) -> None:
+            pass
+
+    class WindowStub:
+        _cleanup_worker = PetWindow._cleanup_worker
+
+        def __init__(self) -> None:
+            self.worker = DisposableStub()
+            self.worker_thread = DisposableStub()
+            self.pending_worker_error = ("chat", "API 连接中断")
+            self.pending_screen_observation_messages = None
+            self.pending_screen_observation_event = None
+            self.screen_observation_followup_in_progress = False
+            self.handled: list[tuple[object, object, str]] = []
+
+        def _log_interaction_stage(self, *_args, **_kwargs) -> None:
+            pass
+
+        def _handle_error(self, message: str) -> None:
+            self.handled.append((self.worker, self.worker_thread, message))
+
+    window = WindowStub()
+    window._cleanup_worker()
+
+    assert window.handled == [(None, None, "API 连接中断")]
+
+
+def test_background_shutdown_keeps_timed_out_thread_reference(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    class FakeThread:
+        def __init__(self) -> None:
+            self.interrupted = False
+            self.quit_called = False
+
+        def isRunning(self) -> bool:
+            return True
+
+        def requestInterruption(self) -> None:
+            self.interrupted = True
+
+        def quit(self) -> None:
+            self.quit_called = True
+
+        def wait(self, _timeout: int) -> bool:
+            return False
+
+    monkeypatch.setattr(pet_window_module, "QThread", FakeThread)
+
+    class WindowStub:
+        _shutdown_background_threads = PetWindow._shutdown_background_threads
+
+        def __init__(self) -> None:
+            self._background_shutdown_started = False
+            self.worker_thread = FakeThread()
+            self.memory_curation_thread = None
+            self.deferred_startup_thread = None
+            self.tts_ready_warmup_thread = None
+            self.tts_migration_thread = None
+
+    window = WindowStub()
+    thread = window.worker_thread
+    window._shutdown_background_threads()
+
+    assert thread.interrupted
+    assert thread.quit_called
+    assert window.worker_thread is thread
+
+
 def test_history_clear_reports_when_memory_store_is_not_ready(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
@@ -4586,6 +4660,12 @@ def test_settings_dialog_ai_theme_success_and_failure_keep_current(monkeypatch) 
             border_color="#cccccc",
             ai_enabled=True,
         ),
+        vision_settings=VisionApiSettings(
+            enabled=True,
+            base_url="https://vision.example.com/v1",
+            api_key="vision-key",
+            model="vision-model",
+        ),
     )
     monkeypatch.setattr("app.ui.settings_dialog.QThread", FakeThread)
     monkeypatch.setattr("app.ui.settings_dialog.ThemeAiWorker", SuccessWorker)
@@ -5032,6 +5112,80 @@ def test_manual_screenshot_text_input_records_marker_without_image_data() -> Non
     assert "data:image/jpeg;base64" not in history[0][1]
 
 
+def test_explicit_screen_question_captures_before_starting_chat_worker(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+
+    window, requests, history = _build_minimal_manual_screenshot_window("你能看到屏幕信息吗？")
+    window.pending_manual_screen_observation = None
+    window.model_vision_enabled = True
+    captures: list[object] = []
+
+    def fake_capture(_window):  # type: ignore[no-untyped-def]
+        captures.append(_window)
+        return ScreenObservation(
+            data_url="data:image/jpeg;base64,automatic",
+            width=1280,
+            height=720,
+            captured_at="2026-06-11T12:00:00+08:00",
+            screen_name="primary",
+        )
+
+    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fake_capture)
+
+    window.send_message("test")
+
+    assert captures == [window]
+    assert len(requests) == 1
+    content = requests[0][-1]["content"]
+    assert isinstance(content, list)
+    assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,automatic"
+    assert "已自主观察屏幕" in content[0]["text"]
+    assert window.pending_visual_observation_jobs[0].source == "explicit_screen_request"
+    assert "data:image/jpeg;base64" not in history[0][1]
+
+
+def test_explicit_screen_capture_failure_is_marked_without_retry(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.agent.screen_policy import ScreenPolicy
+
+    window, requests, _history = _build_minimal_manual_screenshot_window("屏幕上有什么？")
+    window.pending_manual_screen_observation = None
+    window.model_vision_enabled = True
+    monkeypatch.setattr(
+        pet_window_module,
+        "capture_screen_observation",
+        lambda _window: (_ for _ in ()).throw(RuntimeError("缺少系统录屏权限")),
+    )
+
+    window.send_message("test")
+
+    assert len(requests) == 1
+    content = requests[0][-1]["content"]
+    assert isinstance(content, str)
+    assert "屏幕观察失败" in content
+    assert "缺少系统录屏权限" in content
+    assert not ScreenPolicy.should_offer_screen_observation_text(content)
+    assert getattr(window, "pending_visual_observation_jobs", []) == []
+
+
+def test_casual_message_does_not_capture_screen(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+
+    window, requests, _history = _build_minimal_manual_screenshot_window("学姐？")
+    window.pending_manual_screen_observation = None
+    window.model_vision_enabled = True
+    monkeypatch.setattr(
+        pet_window_module,
+        "capture_screen_observation",
+        lambda _window: (_ for _ in ()).throw(AssertionError("普通问候不应截图")),
+    )
+
+    window.send_message("test")
+
+    assert len(requests) == 1
+    assert requests[0][-1] == {"role": "user", "content": "学姐？"}
+
+
 def test_visual_context_is_injected_for_screenshot_followup() -> None:
     from app.ui.pet_window import _add_visual_context_to_messages
 
@@ -5067,6 +5221,42 @@ def test_visual_context_is_injected_for_screenshot_followup() -> None:
         assert "visual_id=vis_recent" in messages[0]["content"]
         assert "屏幕上的那句台词" in messages[0]["content"]
         assert messages[1]["content"] == "刚才截图里有什么台词？"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_visual_context_is_not_injected_for_casual_greeting() -> None:
+    from app.ui.pet_window import _add_visual_context_to_messages
+
+    path = Path("data") / f"test_visual_context_{uuid.uuid4().hex}.jsonl"
+    try:
+        store = VisualObservationStore(path)
+        store.append(
+            VisualObservationRecord(
+                id="vis_failed",
+                created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                source="autonomous_screen",
+                user_text="学姐？",
+                screen_name="primary",
+                width=1280,
+                height=720,
+                summary="视觉摘要生成失败：接口不支持图片。",
+                visible_texts=[],
+                uncertain_texts=[],
+                notable_elements=[],
+                confidence=0.0,
+            )
+        )
+        messages = [{"role": "user", "content": "学姐？"}]
+
+        result = _add_visual_context_to_messages(
+            messages,
+            user_text="学姐？",
+            store=store,
+            has_current_image=False,
+        )
+
+        assert result == messages
     finally:
         path.unlink(missing_ok=True)
 

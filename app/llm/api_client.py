@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import ssl
 import time
@@ -46,6 +47,50 @@ class ApiSettings:
     api_key: str
     model: str
     timeout_seconds: int = 60
+    vision_model: str = ""
+
+
+@dataclass(frozen=True)
+class VisionApiSettings:
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: int = 60
+
+    def to_api_settings(self) -> ApiSettings:
+        return ApiSettings(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=self.model,
+            timeout_seconds=self.timeout_seconds,
+        )
+
+    def is_configured(self) -> bool:
+        return bool(
+            self.enabled
+            and self.base_url.strip()
+            and self.api_key.strip()
+            and self.model.strip()
+        )
+
+
+@dataclass(frozen=True)
+class CompletionUsage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+
+    def __add__(self, other: "CompletionUsage") -> "CompletionUsage":
+        return CompletionUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+            cache_hit_tokens=self.cache_hit_tokens + other.cache_hit_tokens,
+            cache_miss_tokens=self.cache_miss_tokens + other.cache_miss_tokens,
+        )
 
 
 @dataclass(frozen=True)
@@ -65,17 +110,28 @@ class ChatCompletionTurn:
     content: str
     tool_calls: list[NativeToolCall]
     message: dict[str, Any]
+    usage: CompletionUsage = CompletionUsage()
+    reasoning_content: str = ""
 
 
 class OpenAICompatibleClient:
-    def __init__(self, settings: ApiSettings) -> None:
+    def __init__(self, settings: ApiSettings, *, channel: str = "chat") -> None:
         self.settings = settings
+        self.channel = channel.strip() or "chat"
         self._unsupported_chat_params: set[str] = set()
+        self.last_usage = CompletionUsage()
+        self.total_usage = CompletionUsage()
+
+    @property
+    def model(self) -> str:
+        return self.settings.model
 
     def update_settings(self, settings: ApiSettings) -> None:
         """运行时更新 API 配置，供设置界面保存后立即生效。"""
         self.settings = settings
         self._unsupported_chat_params.clear()
+        self.last_usage = CompletionUsage()
+        self.total_usage = CompletionUsage()
 
     def test_connection(self) -> str:
         """发送一次最小聊天请求，验证 Base URL、API Key 和模型是否可用。"""
@@ -110,6 +166,7 @@ class OpenAICompatibleClient:
             method="GET",
             headers={
                 "Authorization": f"Bearer {self.settings.api_key}",
+                "User-Agent": "curl/8.7.1",
             },
         )
         debug_log(
@@ -140,7 +197,7 @@ class OpenAICompatibleClient:
         content = self.complete_raw(
             f"{system_prompt.strip()}\n\n{segmented_reply_instruction}",
             messages,
-            temperature=0.8,
+            temperature=1.3,
             response_format=STRUCTURED_JSON_RESPONSE_FORMAT,
         )
 
@@ -161,14 +218,15 @@ class OpenAICompatibleClient:
         self,
         system_prompt: str,
         messages: list[ChatMessage],
-        temperature: float = 0.8,
+        temperature: float = 1.0,
+        model_override: str | None = None,
         **chat_params: Any,
     ) -> str:
         """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。"""
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
 
         payload = _build_chat_completion_payload(
-            model=self.settings.model,
+            model=(model_override or self.settings.model).strip(),
             system_prompt=system_prompt,
             messages=messages,
             temperature=temperature,
@@ -179,7 +237,7 @@ class OpenAICompatibleClient:
             "准备发送聊天补全请求",
             {
                 "base_url": self.settings.base_url,
-                "model": self.settings.model,
+                "model": model_override or self.settings.model,
                 "timeout_seconds": self.settings.timeout_seconds,
                 "temperature": temperature,
                 "message_count": len(payload["messages"]),
@@ -189,6 +247,7 @@ class OpenAICompatibleClient:
             },
         )
         data = self._post_chat_completions_with_compatibility_fallbacks(payload)
+        self._record_usage(data)
 
         try:
             content = data["choices"][0]["message"]["content"]
@@ -201,6 +260,24 @@ class OpenAICompatibleClient:
         debug_log("API", "模型原始文本返回", {"content": result})
         return result
 
+    def complete_vision_raw(
+        self,
+        system_prompt: str,
+        messages: list[ChatMessage],
+        *,
+        temperature: float = 0.2,
+        **chat_params: Any,
+    ) -> str:
+        """使用同一 API 配置下的视觉模型处理图片。"""
+        model = self.settings.vision_model.strip() or self.settings.model.strip()
+        return self.complete_raw(
+            system_prompt,
+            messages,
+            temperature=temperature,
+            model_override=model,
+            **chat_params,
+        )
+
     def complete_with_tools(
         self,
         system_prompt: str,
@@ -208,7 +285,7 @@ class OpenAICompatibleClient:
         *,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = "auto",
-        temperature: float = 0.8,
+        temperature: float = 1.0,
         structured_response: bool = False,
         **chat_params: Any,
     ) -> ChatCompletionTurn:
@@ -243,6 +320,7 @@ class OpenAICompatibleClient:
             },
         )
         data = self._post_chat_completions_with_compatibility_fallbacks(payload)
+        usage = self._record_usage(data)
 
         try:
             raw_message = data["choices"][0]["message"]
@@ -252,8 +330,14 @@ class OpenAICompatibleClient:
             raise ApiRequestError(f"API 返回 message 格式无法解析：{json.dumps(data, ensure_ascii=False)}")
 
         content = raw_message.get("content")
+        reasoning_content = str(raw_message.get("reasoning_content") or "").strip()
         tool_calls = _parse_native_tool_calls(raw_message.get("tool_calls"))
-        normalized_message = _normalize_assistant_message(raw_message, content, tool_calls)
+        normalized_message = _normalize_assistant_message(
+            raw_message,
+            content,
+            tool_calls,
+            reasoning_content=reasoning_content,
+        )
         debug_log(
             "API",
             "原生工具模型返回",
@@ -269,7 +353,16 @@ class OpenAICompatibleClient:
             content=str(content or "").strip(),
             tool_calls=tool_calls,
             message=normalized_message,
+            usage=usage,
+            reasoning_content=reasoning_content,
         )
+
+    def _record_usage(self, data: dict[str, Any]) -> CompletionUsage:
+        usage = _parse_completion_usage(data.get("usage"))
+        self.last_usage = usage
+        self.total_usage = self.total_usage + usage
+        debug_log("API", "请求用量统计", {"channel": self.channel, **usage.__dict__})
+        return usage
 
     def _post_chat_completions_with_compatibility_fallbacks(
         self,
@@ -327,6 +420,7 @@ class OpenAICompatibleClient:
             headers={
                 "Authorization": f"Bearer {self.settings.api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "curl/8.7.1",
             },
         )
 
@@ -334,9 +428,13 @@ class OpenAICompatibleClient:
             "API",
             "HTTP 请求体已构建",
             {
+                "channel": self.channel,
                 "url": url,
                 "bytes": len(body),
-                "payload": payload,
+                "model": payload.get("model"),
+                "message_count": len(payload.get("messages", [])),
+                "image_count": _count_message_images(payload.get("messages")),
+                "request_fingerprint": _request_fingerprint(payload),
             },
         )
         response_body = self._send_with_retries(request)
@@ -365,7 +463,7 @@ class OpenAICompatibleClient:
                             "attempt": attempt,
                             "status": getattr(response, "status", None),
                             "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
-                            "response_body": response_body,
+                            "response_bytes": len(response_body.encode("utf-8")),
                         },
                     )
                     return response_body
@@ -478,13 +576,95 @@ def _build_chat_completion_payload(
                 "role": "system",
                 "content": system_prompt.strip(),
             },
-            *messages,
+            *_normalize_tool_message_sequence(messages),
         ],
     }
     payload["temperature"] = temperature
     payload.update(_filter_supported_chat_params(chat_params or {}))
     _ensure_json_keyword_for_json_object_response(payload)
     return payload
+
+
+def _normalize_tool_message_sequence(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """确保 tool 消息只跟在声明对应 tool_calls 的 assistant 消息之后。"""
+    normalized: list[ChatMessage] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            normalized.append(
+                _tool_message_as_user_context(message)
+                if message.get("role") == "tool"
+                else message
+            )
+            index += 1
+            continue
+
+        call_ids = _assistant_tool_call_ids(message)
+        if not call_ids:
+            normalized.append(message)
+            index += 1
+            continue
+
+        tool_messages: list[ChatMessage] = []
+        following_messages: list[ChatMessage] = []
+        next_index = index + 1
+        response_ids: set[str] = set()
+        while next_index < len(messages) and messages[next_index].get("role") != "assistant":
+            following = messages[next_index]
+            tool_call_id = str(following.get("tool_call_id", "")).strip()
+            if following.get("role") == "tool" and tool_call_id in call_ids:
+                tool_messages.append(following)
+                response_ids.add(tool_call_id)
+            else:
+                following_messages.append(following)
+            next_index += 1
+            if call_ids.issubset(response_ids):
+                break
+        if call_ids.issubset(response_ids):
+            normalized.append(message)
+            normalized.extend(tool_messages)
+            normalized.extend(
+                _tool_message_as_user_context(item)
+                if item.get("role") == "tool"
+                else item
+                for item in following_messages
+            )
+        else:
+            assistant_without_calls = dict(message)
+            assistant_without_calls.pop("tool_calls", None)
+            normalized.append(assistant_without_calls)
+            normalized.extend(
+                _tool_message_as_user_context(item)
+                if item.get("role") == "tool"
+                else item
+                for item in [*tool_messages, *following_messages]
+            )
+        index = next_index
+    return normalized
+
+
+def _assistant_tool_call_ids(message: ChatMessage) -> set[str]:
+    raw_calls = message.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return set()
+    return {
+        str(item.get("id", "")).strip()
+        for item in raw_calls
+        if isinstance(item, dict) and str(item.get("id", "")).strip()
+    }
+
+
+def _tool_message_as_user_context(message: ChatMessage) -> ChatMessage:
+    tool_name = str(message.get("name", "")).strip()
+    label = f"工具 {tool_name} 的历史结果" if tool_name else "历史工具结果"
+    content = message.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False, default=str)
+    return {
+        "role": "user",
+        "content": f"[{label}]\n{content}",
+    }
 
 
 def _filter_supported_chat_params(params: dict[str, Any]) -> dict[str, Any]:
@@ -593,6 +773,8 @@ def _normalize_assistant_message(
     raw_message: dict[str, Any],
     content: Any,
     tool_calls: list[NativeToolCall],
+    *,
+    reasoning_content: str = "",
 ) -> dict[str, Any]:
     message: dict[str, Any] = {
         "role": "assistant",
@@ -614,7 +796,100 @@ def _normalize_assistant_message(
                 }
                 for call in tool_calls
             ]
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     return message
+
+
+def _parse_completion_usage(raw_usage: Any) -> CompletionUsage:
+    if not isinstance(raw_usage, dict):
+        return CompletionUsage()
+    prompt_tokens = _usage_int(raw_usage.get("prompt_tokens"))
+    completion_tokens = _usage_int(raw_usage.get("completion_tokens"))
+    total_tokens = _usage_int(raw_usage.get("total_tokens")) or (
+        prompt_tokens + completion_tokens
+    )
+    details = raw_usage.get("prompt_tokens_details")
+    cached_tokens = (
+        _usage_int(details.get("cached_tokens"))
+        if isinstance(details, dict)
+        else 0
+    )
+    cache_hit_tokens = _usage_int(
+        raw_usage.get("prompt_cache_hit_tokens")
+    ) or cached_tokens
+    explicit_miss = raw_usage.get("prompt_cache_miss_tokens")
+    cache_miss_tokens = (
+        _usage_int(explicit_miss)
+        if explicit_miss is not None
+        else max(0, prompt_tokens - cache_hit_tokens)
+    )
+    return CompletionUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        cache_hit_tokens=cache_hit_tokens,
+        cache_miss_tokens=cache_miss_tokens,
+    )
+
+
+def _usage_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _count_message_images(messages: Any) -> int:
+    if not isinstance(messages, list):
+        return 0
+    return sum(
+        1
+        for message in messages
+        if isinstance(message, dict)
+        for part in (
+            message.get("content")
+            if isinstance(message.get("content"), list)
+            else []
+        )
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    )
+
+
+def _request_fingerprint(payload: dict[str, Any]) -> str:
+    safe_payload = {
+        **payload,
+        "messages": _messages_without_image_data(payload.get("messages")),
+    }
+    encoded = json.dumps(
+        safe_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _messages_without_image_data(messages: Any) -> Any:
+    if not isinstance(messages, list):
+        return messages
+    sanitized: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            sanitized.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            sanitized.append(message)
+            continue
+        parts: list[Any] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                parts.append({"type": "image_url", "image_url": "<image omitted>"})
+            else:
+                parts.append(part)
+        sanitized.append({**message, "content": parts})
+    return sanitized
 
 
 def messages_contain_image(messages: list[ChatMessage]) -> bool:
