@@ -14,6 +14,20 @@
 | `app/agent/web_search.py` | CJK 字符级搜索过滤 |
 | `app/llm/chinese_text.py` | 简体中文强制转换 |
 
+### 角色沉浸增强
+
+**原作剧情知识库**
+- 从游戏 `data.pac` 中提取了夜乃桜的完整桜路线（45 个场景，180-224）和 Grand Route 真结局路线（21 个场景，226-246）的原文剧本，总计约 14MB 原始文本。
+- `characters/sakura/lore.md`（1.8MB）：包含桜路线 + Grand Route 的完整原文剧本，按场景章节结构化存储。
+- `app/agent/character_lore.py`：43 个关键词的倒排索引，对话中自动匹配用户输入中的关键词，命中后从 lore.md 检索相关场景，将原文记忆以 system 消息形式注入 LLM 上下文。
+- `characters/sakura/card.md`（155 行 → 282 行）：**14 个精确世界观条目**（反現実、B.E.G.、眷属化、黒列車、四心臓、聖穢の法、崩月家等）替代了原卡模糊的 1 段泛泛概述；**7 幕完整剧情**覆盖从初见、暗杀未遂、ラブホテル、所有物交渉、初 H、正式告白、父决战到卡拉 OK 终幕的因果全链路；**15 条记忆清单**以桜第一人称视角精确记载每个关键事件的对白与情绪。
+
+**叙述段/对话段优化**
+- 叙述段 `ja` 留空、`zh` 写纯中文第一人称描写，不朗读仅显示。台词段 `ja` 写日文用于 TTS、`zh` 写中文译文。
+- `app/llm/chat_reply.py`：假名密度检测（`kana_ratio > 0.5` 触发静默降级），避免日本语叙述段误转为 TTS 朗读。
+- `app/llm/prompts/blocks.py`：zh 必填守卫 + 复读禁止规则，字幕不再回退到日文显示。
+- `app/ui/pet_window.py` + `subtitle_controller.py`：AlignBottom 底对齐 + 逐字 repaint，多行叙述始终可见最新内容。
+
 ### 核心修改
 | 文件 | 改动 |
 |------|------|
@@ -24,8 +38,6 @@
 | `app/llm/prompts/blocks.py` | zh 必填守卫 + 复读禁止规则 |
 | `app/ui/pet_window.py` | AlignBottom 字幕对齐 |
 | `app/ui/subtitle_controller.py` | repaint 实时重绘 |
-| `characters/sakura/card.md` | 155 行 → 282 行：14 世界观条目 + 7 幕完整剧情 + 15 条记忆清单 |
-| `characters/sakura/lore.md` | 1.8MB：游戏桜路线 + Grand Route 原文剧本 |
 | `start.bat` | Conda 环境自动激活 |
 | `requirements.txt` | CUDA 安装指引 |
 | `.gitignore` | 排除 API 备份文件 |
