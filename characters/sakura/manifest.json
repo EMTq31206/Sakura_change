@@ -1,0 +1,45 @@
+{
+  "format": "sakura.character.archive",
+  "version": 1,
+  "character": {
+    "id": "sakura",
+    "display_name": "夜乃桜",
+    "initial_message": "……起動した。用事があるなら、呼んで。",
+    "card": "character/card.md",
+    "portrait": {
+      "default": "character/portraits/A020.png",
+      "expressions": {
+        "站立待机": "character/portraits/A020.png",
+        "开心脸红": "character/portraits/A061.png",
+        "张嘴疑问": "character/portraits/A070.png",
+        "害羞脸红": "character/portraits/A081.png",
+        "难过沮丧": "character/portraits/A130.png",
+        "不满无语": "character/portraits/A140.png",
+        "两眼放光": "character/portraits/A150.png",
+        "高兴满足": "character/portraits/A170.png",
+        "吃醋不满": "character/portraits/A230.png",
+        "自信拍胸": "character/portraits/B180.png",
+        "自信撩发": "character/portraits/E050.png",
+        "侧身无语": "character/portraits/E140.png",
+        "伸手命令": "character/portraits/I010.png",
+        "伸手抚摸": "character/portraits/I180.png"
+      }
+    },
+    "reply": {
+      "tones": [
+        "中性",
+        "不满",
+        "害羞",
+        "请求",
+        "惊讶"
+      ]
+    },
+    "voice": {
+      "gpt_model": "character/voice/models/Sakura-e15.ckpt",
+      "sovits_model": "character/voice/models/Sakura_e8_s7176.pth",
+      "tone_refs": "character/voice/refs/ref.txt",
+      "ref_lang": "ja",
+      "text_lang": "ja"
+    }
+  }
+}
