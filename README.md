@@ -49,6 +49,39 @@
 
 ## 环境配置
 
+### 大文件下载与放置路径
+
+GitHub 仓库只包含代码、角色卡、剧情知识库和立绘。声线模型、TTS 整合包和完整 `.char` 归档体积较大，需要从百度网盘单独下载。下载后按下面路径解压即可，不需要修改 `character.json` 或其他配置文件。
+
+| 下载文件 | 操作 | 完成后的目标路径 |
+|---|---|---|
+| `sakura_voice.zip` | 解压后把里面的 `voice` 文件夹放进 `characters/sakura/` | `characters/sakura/voice/` |
+| `GPT-SoVITS-v2pro-20250604-nvidia50.7z` | 解压后把 `GPT-SoVITS-v2pro-20250604-nvidia50` 文件夹放进 `tts/g50/` | `tts/g50/GPT-SoVITS-v2pro-20250604-nvidia50/` |
+| `sakura.char` | 不要解压到项目目录；启动后进入设置页，点击“导入 .char”选择该文件 | 可放在下载目录或任意位置 |
+
+放置完成后应能看到以下结构：
+
+```text
+characters/sakura/voice/
+  models/Sakura-e15.ckpt
+  models/Sakura_e8_s7176.pth
+  refs/ref.txt
+  refs/tone_refs/00_中性_VO01_2785.ogg
+  refs/tone_refs/01_不满_VO01_3365.ogg
+  refs/tone_refs/03_害羞_VO01_3976.ogg
+  refs/tone_refs/05_请求_VO01_1215.wav
+  refs/tone_refs/06_困惑_VO01_0056.ogg
+  refs/tone_refs/07_惊讶_VO01_2659.wav
+  refs/tone_refs/08_俏皮_VO01_3745.ogg
+
+tts/g50/GPT-SoVITS-v2pro-20250604-nvidia50/
+  api_v2.py
+  GPT_SoVITS/
+  ...
+```
+
+> 如果只 clone GitHub 仓库但没有放入 `characters/sakura/voice/`，当前内置角色会缺少声线资源，TTS 完整体验不可用。建议首次启动前先下载并解压 `sakura_voice.zip`。
+
 ### 前提
 - Windows 10/11 x64
 - NVIDIA GPU（RTX 30/40/50 系列，建议 8GB+ VRAM）
@@ -70,7 +103,7 @@ python -m playwright install chromium
 
 ### API 配置
 
-在 `data/config/` 下创建 `api.yaml`（模板参考 `api.yaml.deepseek`）：
+在 `data/config/` 下创建 `api.yaml`：
 
 ```yaml
 llm:
@@ -96,7 +129,13 @@ tts:
 
 ### TTS 整合包
 
-启动后在设置页 → TTS → 一键下载，选择 **GPT-SoVITS v2pro NVIDIA 50 系**。
+推荐直接从百度网盘下载整合包并解压到：
+
+```text
+tts/g50/GPT-SoVITS-v2pro-20250604-nvidia50/
+```
+
+如果没有提前下载，也可以启动后在设置页 → TTS → 一键下载，选择 **GPT-SoVITS v2pro NVIDIA 50 系**。
 
 ### 启动
 

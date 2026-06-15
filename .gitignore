@@ -13,7 +13,16 @@ runtime/
 /tts/
 env/
 node_modules/
-characters/
+# 角色数据：排除大体积归档/声线二进制，保留文本配置和立绘
+*.char
+*.voice
+characters/**/*.char
+characters/**/voice/
+characters/**/models/
+characters/**/refs/
+characters/**/_sakura_full_route.txt
+characters/**/說明.txt
+characters/**/说明.txt
 
 .pytest_cache/
 .pytest_tmp/
